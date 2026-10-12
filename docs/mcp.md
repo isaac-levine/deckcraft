@@ -33,5 +33,20 @@ deck.
 Useful commands for building decks: `slide.new {layout, title, body}`, `shape.insert {preset,
 rect, text}`, `shape.connect {from, to, preset}`, `shape.freeform {points, closed, smooth}`,
 `shape.merge {op, ids}`, `format.*`, `design.theme`, `transition.set`, `animation.set`,
-`chart.*`, `table.*`, `file.export {path, layout}`. `deckcraft-cli describe ID` prints any
-command's parameters.
+`chart.*`, `table.*`, `file.export {path, layout}`, `template.fields`, `template.fill {data}`.
+`deckcraft-cli describe ID` prints any command's parameters.
+
+## Templates and data
+
+A deck can be a template: write `{{name}}` where a value goes (titles, body text, table cells,
+grouped shapes, notes). `template.fields` lists the names a deck uses, and `template.fill {data:
+{name: value}}` replaces every token, keeping the formatting of the text it sits in. Tokens that
+PowerPoint split across several runs are still found. Names without a value are left in place
+and reported (`missing: "empty"` blanks them, `missing: "error"` refuses to change anything).
+
+From the CLI, `--data` takes the values from a JSON file and runs before any `--cmd`:
+
+```sh
+deckcraft-cli run --in quarterly.pptx --data fields.json --cmd 'file.export={"path":"q3.png","slide":0}'
+deckcraft-cli run --in quarterly.pptx --cmd 'template.fields' --print
+```
