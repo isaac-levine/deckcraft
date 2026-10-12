@@ -14,6 +14,7 @@ pub mod review;
 pub mod shape;
 pub mod slide;
 pub mod table;
+pub mod template;
 pub mod text;
 pub mod transition;
 
@@ -140,6 +141,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(review::specs());
         v.extend(inspect::specs());
         v.extend(media::specs());
+        v.extend(template::specs());
         v
     })
 }

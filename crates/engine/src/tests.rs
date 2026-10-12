@@ -543,3 +543,133 @@ fn inserted_hyperlinks_look_like_links() {
     s.execute("format.underline", &json!({})).unwrap();
     assert_eq!(s.execute("format.state", &json!({})).unwrap()["underline"], false);
 }
+
+// ---------- templates ----------
+
+fn title_id(s: &Session) -> u64 {
+    u64::from(s.doc().unwrap().current_slide().unwrap().shapes[0].id.0)
+}
+
+fn set_runs(s: &mut Session, id: u64, runs: Vec<deckcraft_model::text::Run>) {
+    s.edit(|doc, sel| {
+        let shapes = crate::shapes_mut(doc, sel).unwrap();
+        let sh = deckcraft_model::find_shape_mut(shapes, deckcraft_model::ShapeId(id as u32)).unwrap();
+        let body = sh.text.get_or_insert_with(Default::default);
+        body.paragraphs = vec![deckcraft_model::text::Paragraph { runs, ..Default::default() }];
+        Ok(())
+    })
+    .unwrap();
+}
+
+fn runs_of(s: &Session, id: u64) -> Vec<(String, bool)> {
+    let sh = s.doc().unwrap().shape(deckcraft_model::ShapeId(id as u32)).unwrap();
+    sh.text.as_ref().unwrap().paragraphs[0].runs.iter().map(|r| (r.text.clone(), r.props.bold == Some(true))).collect()
+}
+
+#[test]
+fn template_fields_lists_names_counts_and_slides() {
+    let mut s = session();
+    let t = title_id(&s);
+    s.execute("text.set", &json!({"id": t, "text": "Hello {{ name }} and {{name}}, {{city}}"})).unwrap();
+    s.execute("slide.new", &json!({"layout": "titleOnly", "title": "{{city}} report"})).unwrap();
+    s.execute("slide.notes", &json!({"text": "Presenter: {{presenter}}"})).unwrap();
+    let v = s.execute("template.fields", &json!({})).unwrap();
+    let f = v["fields"].as_array().unwrap();
+    assert_eq!(f.len(), 3);
+    assert_eq!(f[0], json!({"name": "name", "count": 2, "slides": [0]}));
+    assert_eq!(f[1], json!({"name": "city", "count": 2, "slides": [0, 1]}));
+    assert_eq!(f[2], json!({"name": "presenter", "count": 1, "slides": [1]}));
+    let v = s.execute("template.fields", &json!({"slides": [1]})).unwrap();
+    assert_eq!(v["fields"].as_array().unwrap().len(), 2);
+    assert!(s.execute("template.fields", &json!({"slides": [9]})).is_err());
+}
+
+#[test]
+fn template_fill_replaces_in_one_run_and_keeps_props() {
+    let mut s = session();
+    let t = title_id(&s);
+    let bold = deckcraft_model::text::RunProps { bold: Some(true), ..Default::default() };
+    set_runs(&mut s, t, vec![deckcraft_model::text::Run::with("Dear {{name}}, welcome", bold)]);
+    let v = s.execute("template.fill", &json!({"data": {"name": "Ada"}})).unwrap();
+    assert_eq!(v, json!({"replaced": 1, "missing": []}));
+    assert_eq!(runs_of(&s, t), vec![("Dear Ada, welcome".to_string(), true)]);
+}
+
+#[test]
+fn template_fill_joins_a_token_split_across_runs() {
+    let mut s = session();
+    let t = title_id(&s);
+    let bold = deckcraft_model::text::RunProps { bold: Some(true), ..Default::default() };
+    set_runs(
+        &mut s,
+        t,
+        vec![
+            deckcraft_model::text::Run::with("Hello {{na", bold),
+            deckcraft_model::text::Run::new("me"),
+            deckcraft_model::text::Run::new("}} from {{city}}!"),
+        ],
+    );
+    let v = s.execute("template.fill", &json!({"data": {"name": "Ada", "city": "London"}})).unwrap();
+    assert_eq!(v["replaced"], 2);
+    // The value takes the first run's formatting; the middle run vanished; the tail keeps its text.
+    assert_eq!(runs_of(&s, t), vec![("Hello Ada".to_string(), true), (" from London!".to_string(), false)]);
+}
+
+#[test]
+fn template_fill_handles_tables_notes_and_groups() {
+    let mut s = session();
+    let tbl = s.execute("insert.table", &json!({"rows": 1, "cols": 2, "rect": [50, 300, 300, 40]})).unwrap()["id"].as_u64().unwrap();
+    s.execute("text.set", &json!({"id": tbl, "cell": [0, 1], "text": "Total: {{total}}"})).unwrap();
+    s.execute("slide.notes", &json!({"text": "Ask {{name}} about {{total}}"})).unwrap();
+    let a = s.execute("shape.insert", &json!({"preset": "rect", "rect": [10, 10, 100, 50], "text": "{{name}}"})).unwrap()["id"].as_u64().unwrap();
+    let b = s.execute("shape.insert", &json!({"preset": "rect", "rect": [120, 10, 100, 50], "text": "plain"})).unwrap()["id"].as_u64().unwrap();
+    s.execute("arrange.group", &json!({"ids": [a, b]})).unwrap();
+    let v = s.execute("template.fill", &json!({"data": {"name": "Ada", "total": 42}})).unwrap();
+    assert_eq!(v, json!({"replaced": 4, "missing": []}));
+    let sh = s.doc().unwrap().shape(deckcraft_model::ShapeId(tbl as u32)).unwrap().clone();
+    let deckcraft_model::ShapeKind::Table(table) = &sh.kind else { panic!("not a table") };
+    assert_eq!(table.cell(0, 1).unwrap().text.text(), "Total: 42");
+    assert_eq!(s.doc().unwrap().current_slide().unwrap().notes.text(), "Ask Ada about 42");
+    assert_eq!(s.doc().unwrap().shape(deckcraft_model::ShapeId(a as u32)).unwrap().text.as_ref().unwrap().text(), "Ada");
+}
+
+#[test]
+fn template_fill_missing_modes() {
+    let mut s = session();
+    let t = title_id(&s);
+    s.execute("text.set", &json!({"id": t, "text": "{{a}} {{b}}"})).unwrap();
+    let v = s.execute("template.fill", &json!({"data": {"a": "A"}})).unwrap();
+    assert_eq!(v, json!({"replaced": 1, "missing": ["b"]}));
+    assert_eq!(s.execute("text.get", &json!({"id": t})).unwrap()["text"], "A {{b}}");
+
+    let before = s.execute("text.get", &json!({"id": t})).unwrap()["text"].clone();
+    let e = s.execute("template.fill", &json!({"data": {}, "missing": "error"})).unwrap_err().to_string();
+    assert!(e.contains("no data for b"), "{e}");
+    assert_eq!(s.execute("text.get", &json!({"id": t})).unwrap()["text"], before);
+
+    let v = s.execute("template.fill", &json!({"data": {}, "missing": "empty"})).unwrap();
+    assert_eq!(v, json!({"replaced": 1, "missing": ["b"]}));
+    assert_eq!(s.execute("text.get", &json!({"id": t})).unwrap()["text"], "A ");
+
+    assert!(s.execute("template.fill", &json!({"data": {}, "missing": "nope"})).is_err());
+    assert!(s.execute("template.fill", &json!({})).is_err());
+    assert!(s.execute("template.fill", &json!({"data": {"a": [1, 2]}})).unwrap_err().to_string().contains("data.a"));
+}
+
+#[test]
+fn template_fill_scalars_multibyte_and_undo() {
+    let mut s = session();
+    let t = title_id(&s);
+    s.execute("text.set", &json!({"id": t, "text": "Café {{x}} 日本 {{n}} {{ok}} {{none}}"})).unwrap();
+    let v = s.execute("template.fill", &json!({"data": {"x": "ü", "n": 3.5, "ok": true, "none": null}})).unwrap();
+    assert_eq!(v["replaced"], 4);
+    assert_eq!(s.execute("text.get", &json!({"id": t})).unwrap()["text"], "Café ü 日本 3.5 true ");
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.execute("text.get", &json!({"id": t})).unwrap()["text"], "Café {{x}} 日本 {{n}} {{ok}} {{none}}");
+    // Only the chosen slides change.
+    s.execute("slide.new", &json!({"layout": "titleOnly", "title": "{{x}}"})).unwrap();
+    let v = s.execute("template.fill", &json!({"data": {"x": "Y"}, "slides": [1]})).unwrap();
+    assert_eq!(v["replaced"], 1);
+    let first = s.doc().unwrap().doc.slides[0].shapes[0].text.as_ref().unwrap().text();
+    assert_eq!(first, "Café {{x}} 日本 {{n}} {{ok}} {{none}}");
+}
