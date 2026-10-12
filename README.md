@@ -148,6 +148,7 @@ same verbs:
 ```sh
 deckcraft-cli commands format.          # list commands
 deckcraft-cli run --sample --cmd 'slide.new={"layout":"titleOnly","title":"Hello"}' --save hello.deckcraft
+deckcraft-cli run --in template.pptx --data fields.json --export out.pdf   # fill {{name}} tokens from JSON
 deckcraft-cli mcp                       # MCP server over stdio (headless)
 deckcraft-cli mcp --connect 7990        # drive the running app (deckcraft --control 7990)
 ```

@@ -4,7 +4,7 @@
 //! deckcraft-cli info FILE                       # slides, titles, layouts (JSON)
 //! deckcraft-cli render (FILE | --sample) [--slide N | --all] [--scale S] OUT.png|OUT_DIR
 //! deckcraft-cli convert IN OUT                  # .deckcraft ⇄ .pptx, outline .txt, .png (first slide)
-//! deckcraft-cli run [--in FILE | --sample] [--cmd ID[=JSON]]... [--save OUT] [--export OUT] [--print]
+//! deckcraft-cli run [--in FILE | --sample] [--data FIELDS.json] [--cmd ID[=JSON]]... [--save OUT] [--export OUT] [--print]
 //! deckcraft-cli commands [FILTER]               # list commands (JSON)
 //! deckcraft-cli describe ID                     # one command
 //! deckcraft-cli app [--port PORT] COMMAND [JSON] | --method METHOD [JSON]   # drive the running app
@@ -35,7 +35,7 @@ macro_rules! outln {
 const USAGE: &str = "usage: deckcraft-cli info FILE
        deckcraft-cli render (FILE | --sample) [--slide N | --all] [--scale S] [--edit] OUT
        deckcraft-cli convert IN OUT
-       deckcraft-cli run [--in FILE | --sample] [--cmd ID[=JSON]]... [--save OUT] [--export OUT] [--print]
+       deckcraft-cli run [--in FILE | --sample] [--data FIELDS.json] [--cmd ID[=JSON]]... [--save OUT] [--export OUT] [--print]
        deckcraft-cli commands [FILTER]
        deckcraft-cli describe COMMAND
        deckcraft-cli app [--port PORT] COMMAND [JSON] | --method METHOD [JSON]
@@ -179,6 +179,7 @@ fn convert(args: &[String]) -> Result<(), String> {
 fn run(args: &[String]) -> Result<(), String> {
     let mut input = None;
     let mut sample = false;
+    let mut data = None;
     let mut cmds = vec![];
     let mut save = None;
     let mut export = None;
@@ -188,6 +189,7 @@ fn run(args: &[String]) -> Result<(), String> {
         match a.as_str() {
             "--in" => input = Some(it.next().cloned().ok_or("--in needs a file")?),
             "--sample" => sample = true,
+            "--data" => data = Some(it.next().cloned().ok_or("--data needs a JSON file")?),
             "--cmd" => cmds.push(it.next().cloned().ok_or("--cmd needs ID[=JSON]")?),
             "--save" => save = Some(it.next().cloned().ok_or("--save needs a path")?),
             "--export" => export = Some(it.next().cloned().ok_or("--export needs a path")?),
@@ -197,6 +199,14 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     let mut s = Session::new();
     open(&mut s, input.as_deref(), sample)?;
+    // Fill `{{name}}` tokens first, so the commands that follow see the finished text.
+    if let Some(path) = data {
+        let fields = template_data(&path)?;
+        let r = s.execute("template.fill", &json!({"data": fields})).map_err(|e| e.to_string())?;
+        if print {
+            outln!("template.fill → {r}");
+        }
+    }
     for c in cmds {
         let (id, p) = match c.split_once('=') {
             Some((id, j)) => (id.to_string(), serde_json::from_str::<Value>(j).map_err(|e| format!("{id}: bad JSON: {e}"))?),
@@ -214,6 +224,16 @@ fn run(args: &[String]) -> Result<(), String> {
         s.execute("file.export", &json!({"path": p})).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// The JSON object in a `--data` file (`{"name": "value", ...}`).
+fn template_data(path: &str) -> Result<Value, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("{path}: bad JSON: {e}"))?;
+    if !v.is_object() {
+        return Err(format!("{path}: --data needs a JSON object of field values"));
+    }
+    Ok(v)
 }
 
 fn describe(id: Option<&str>) -> Result<(), String> {
