@@ -1,6 +1,6 @@
 # Where DeckCraft falls short of PowerPoint
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** minor (core-workflow alpha gate added; stage stays alpha; previous: major, first itemized gap list; full re-measure against PowerPoint for Mac 16.113.4 and the open GitHub issues) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** minor (3-D bevel, camera and face lighting rendered; previous: minor, IME composition and CJK interface text landed, #101; previous: minor, core-workflow alpha gate added; stage stays alpha; before that: major, first itemized gap list; full re-measure against PowerPoint for Mac 16.113.4 and the open GitHub issues) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365)
 
 Every known shortfall, one entry each, ranked by how much it stops someone who presents with
 PowerPoint from switching. This is the work list: pick from the top. Numbers are summarized in
@@ -20,7 +20,7 @@ revision history.
 | 1 | PPTX never tested against a corpus of real decks | File format | B | 20–35 | [file-format-parity.md](file-format-parity.md) |
 | 2 | Data loss and crashes on common paths (#60, #40, #59) | Stability | B | 6–12 | this file |
 | 3 | PPTX round trip drops comment threads, media options, rewind (#70, #74, #77) | File format | B | 3–6 | [file-format-parity.md](file-format-parity.md) |
-| 4 | EMF/WMF and SVG pictures don't render | File format | B | 8–14 | [file-format-parity.md](file-format-parity.md) |
+| 4 | SVG pictures don't render (EMF/WMF do) | File format | B | 6–12 | [file-format-parity.md](file-format-parity.md) |
 | 5 | No localization: English only | Localization | B (infra + 5 languages) | 55–90 | [localization-parity.md](localization-parity.md) |
 | 6 | No printing | Feature | B | 5–8 | [file-format-parity.md](file-format-parity.md) |
 | 7 | Fonts: only Regular, Bold and Italic faces (#69) | Feature | B | 3–5 | [ui-parity.md](ui-parity.md) |
@@ -75,14 +75,14 @@ Detail in [file-format-parity.md](file-format-parity.md).
 - **Impact:** a deck opened and saved silently loses review state and show behaviour.
 - **Estimate:** 3–6 h. **Beta blocker.**
 
-### EMF/WMF and SVG pictures don't render
+### SVG pictures don't render
 - **Evidence:** `crates/render/src/images.rs` decodes through `image` 0.25 (PNG, JPEG, WebP, GIF,
-  TIFF, BMP); nothing reads EMF, WMF or SVG. Decks from Windows often hold EMF (pasted charts,
-  Visio, logos); PowerPoint's Insert Icons stores SVG with a PNG fallback.
-- **Impact:** blank pictures in real decks; SVG icons show only their raster fallback, and SVG files
-  can't be inserted.
-- **Estimate:** 8–14 h (an SVG renderer through `resvg`-style crates, an EMF/WMF record player for
-  the common records). **Beta blocker** for EMF.
+  TIFF, BMP), and EMF/WMF through `deckcraft-metafile` (ported from WordCraft: paths, fills, pens,
+  pattern and hatch brushes, bitmaps and text; clip regions and EMF+ records are not drawn).
+  Nothing reads SVG; PowerPoint's Insert Icons stores SVG with a PNG fallback.
+- **Impact:** SVG icons show only their raster fallback, and SVG files can't be inserted. An
+  EMF/WMF that clips its drawing (EXTSELECTCLIPRGN, INTERSECTCLIPRECT) draws past its clip.
+- **Estimate:** 4–8 h (an SVG renderer through `resvg`-style crates); EMF/WMF clip regions 2–4 h.
 
 ### Template, slide-show and macro variants are saved as plain `.pptx`
 - **Evidence:** `crates/pptx/src/write/mod.rs` always writes the
@@ -165,9 +165,14 @@ Detail in [animation-parity.md](animation-parity.md). 10–16 h; the pane is a *
 - **Estimate:** 4–6 h.
 
 ### Edit points, text warp, 3-D
-- **Evidence:** checklist rows "Edit points" (P1 missing), "Text warp transforms", "Bevel and 3-D
-  rotation" (missing; `scene3d`/`sp3d` kept as raw XML on round trip).
-- **Estimate:** 4–6 h (edit points), 6–10 h (warp), 8–12 h (3-D render approximation).
+- **Evidence:** checklist rows "Edit points" (P1 missing), "Text warp transforms" (partial: all 40
+  `prstTxWarp` presets render and their adjusts round-trip, but there is no Transform gallery or
+  command to apply one, no adjust handles, and arc/circle placement can differ from PowerPoint by
+  1–3 % of the path length), "Bevel and 3-D rotation" (partial: bevels, camera presets and rotations and face lighting
+  render as approximations and `scene3d`/`sp3d` round-trip as raw XML; no extrusion or side faces,
+  only the three-point rig, and no command or pane to apply 3-D).
+- **Estimate:** 4–6 h (edit points), 2–4 h (warp gallery, command and handles), 6–10 h (3-D extrusion,
+  rigs and materials, Format Shape page).
 
 ### Proofing: spelling, thesaurus, AutoCorrect
 - **Evidence:** `review.spelling` checks a small built-in list of frequent misspellings
@@ -193,8 +198,8 @@ Detail in [ui-parity.md](ui-parity.md).
   blocker.**
 - **Format Shape pane thinner than PowerPoint's** (Fill/Line/Effects/Size/Text Box pages, picture
   and texture options, 3-D). 6–10 h. **Beta blocker.**
-- **First-run and start screen** (#17, #76: missing File overlay, broken layout; recent files and
-  templates thin). 3–5 h.
+- **File tab depth** (#76 landed the Backstage): no online templates, cloud places, printer
+  choice, video/GIF/CD exports or document protection. 4–8 h for the parts that need no cloud.
 - **Window chrome** (#71 macOS controls misaligned, #26 GNOME title bar, #41 system light/dark).
   2–4 h.
 - **Icon consistency across Craft apps** (#73, #56). 2–4 h; coordinate in craftrules.
@@ -221,7 +226,11 @@ Detail in [localization-parity.md](localization-parity.md).
 - **English only, no string catalog** (#15, #30; Ukrainian PR #34 open). PowerPoint for Mac ships
   26 languages. Infrastructure 8–14 h, then 3–16 h per language plus native review. Beta needs the
   infrastructure and at least Simplified Chinese, Spanish, French, German and Japanese (~30–45 h).
-- **No IME composition in text editing** (CJK input). 3–6 h.
+- **Hangul in the interface needs an installed Korean font** (#101). craft-fonts has no Korean face
+  (Noto CJK is excluded by the asset policy), so the web build draws Korean file names, notes and
+  outline text as boxes; desktop borrows Malgun Gothic, Apple SD Gothic Neo or Noto Sans CJK.
+  Adding an openly licensed Korean face (e.g. Nanum Gothic, OFL) to craft-fonts: 1–2 h.
+- **Table cells don't underline an IME composition** (the text is composed in place, #101). 1 h.
 - **UI isn't mirrored for right-to-left languages.** 6–10 h.
 - **Browser build draws Arabic and Hebrew as missing-glyph boxes in exports** (#81). 1–2 h.
 
@@ -247,5 +256,9 @@ Detail in [localization-parity.md](localization-parity.md).
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-13 | minor | Shape, picture and table rendering checked against PowerPoint on ~150 synthetic edge-case slides; 3-D bevels, cameras and face lighting now render approximately (gap narrowed to extrusion, rigs and the 3-D pane) |
+| 2026-10-12 | minor | IME composition in slide text and notes, and CJK interface text with real glyphs (#101): the IME gap is now Korean on the web and table-cell underlines |
+| 2026-10-12 | minor | EMF/WMF text, pattern and hatch brushes drawn; legacy OLE and ActiveX previews shown; the SVG gap keeps only EMF clip regions |
+| 2026-10-12 | minor | Text warps render (all 40 presets, adjusts round-trip); the warp gap is now the gallery, command and handles |
 | 2026-10-10 | minor | Noted that no gap blocks alpha (core-workflow gate passes) |
 | 2026-10-10 | major | Created: every gap from the 2026-10-10 re-measure and the 16 open GitHub issues, ranked, with beta blockers marked |

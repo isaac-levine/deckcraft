@@ -212,7 +212,7 @@ Carried from the 2026-10-07 ROADMAP status and updated with what has landed sinc
   header/footer fields, embedded media, unlimited undo on shared slide snapshots.
 - **Themes:** 8 original themes with colour and font schemes, custom colours and fonts,
   backgrounds (solid, gradient, picture, pattern), slide size presets.
-- **Shapes:** ~150 preset geometries with adjustment handles, text boxes, pictures (crop,
+- **Shapes:** ~180 preset geometries with adjustment handles, text boxes, pictures (crop,
   corrections, animated GIFs that play and pause), tables with styles, charts (column, bar, line,
   area, pie, doughnut, scatter and more), basic SmartArt, groups, connectors glued to sites,
   freeform/curve/scribble, merge shapes, ink, action buttons, WordArt; flipped shapes keep their

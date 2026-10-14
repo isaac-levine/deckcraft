@@ -11,6 +11,7 @@ pub mod inspect;
 pub mod media;
 pub mod merge;
 pub mod review;
+pub mod selection;
 pub mod shape;
 pub mod slide;
 pub mod table;
@@ -130,6 +131,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(insert::specs());
         v.extend(shape::specs());
         v.extend(arrange::specs());
+        v.extend(selection::specs());
         v.extend(merge::specs());
         v.extend(text::specs());
         v.extend(format::specs());
@@ -307,6 +309,18 @@ pub(crate) fn edit_shapes(s: &mut Session, p: &Value, cmd: &str, f: impl Fn(&mut
         }
         Ok(Value::from(n))
     })
+}
+
+/// [`edit_shapes`] for edits a locked object refuses (move, size, rotate, flip, reshape, crop):
+/// locked targets are left out, and when every target is locked nothing changes.
+pub(crate) fn edit_geometry(s: &mut Session, p: &Value, cmd: &str, f: impl Fn(&mut deckcraft_model::Shape) -> Result<()>) -> Result<Value> {
+    let ids = targets(s, p)?;
+    let st = s.doc()?;
+    let free: Vec<u32> = ids.iter().filter(|id| !st.shape(**id).is_some_and(|x| x.locked)).map(|id| id.0).collect();
+    if !ids.is_empty() && free.is_empty() {
+        return Err(bad(cmd, "the object is locked"));
+    }
+    edit_shapes(s, &with_param(p, "ids", Value::from(free)), cmd, f)
 }
 
 pub(crate) fn current_shapes<'a>(doc: &'a deckcraft_model::Presentation, sel: &crate::Selection) -> Option<&'a Vec<deckcraft_model::Shape>> {

@@ -49,7 +49,15 @@ pub fn specs() -> Vec<CommandSpec> {
             color
         ),
         cmd!("format.highlight", "Text Highlight Color", ["Home", "Font"], None, "{color? (absent = none)}", has_text_or_shapes, highlight),
-        cmd!("format.case", "Change Case", ["Home", "Font"], Some("Shift+F3"), "{mode: sentence|lower|upper|title|toggle}", has_text_or_shapes, case),
+        cmd!(
+            "format.case",
+            "Change Case",
+            ["Home", "Font"],
+            Some("Shift+F3"),
+            "{mode?: cycle|sentence|lower|upper|title|toggle} — cycle (Shift+F3, the default) goes lowercase → Capitalize Each Word → UPPERCASE; a caret in a word changes that word",
+            has_text_or_shapes,
+            case
+        ),
         cmd!("format.caps", "Caps", [], None, "{caps: none|small|all}", has_text_or_shapes, caps),
         cmd!(
             "format.spacing",
@@ -328,15 +336,23 @@ fn text_outline(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn case(s: &mut Session, p: &Value) -> Result<Value> {
-    let mode = str_param(p, "mode").unwrap_or("sentence").to_string();
+    let mode = str_param(p, "mode").unwrap_or("cycle").to_string();
     let st = s.doc()?;
     if let Some(t) = st.selection.text.clone() {
-        let (a, b) = t.ordered();
-        if a == b {
-            return ok();
+        let (mut a, mut b) = t.ordered();
+        let body = super::text::body_of(st, &t).cloned().unwrap_or_default();
+        let collapsed = a == b;
+        if collapsed {
+            // Shift+F3 with a bare caret changes the word it is in and puts the caret at its start.
+            let (wa, wb) = ed::word_at(&body, a);
+            let is_word = ed::text_range(&body, wa, wb).chars().any(char::is_alphanumeric);
+            if !(is_word && wa.1 <= a.1 && a.1 < wb.1) {
+                return ok();
+            }
+            (a, b) = (wa, wb);
         }
-        let m = mode.clone();
-        super::text::edit_text(s, move |body, _| {
+        let m = if mode == "cycle" { ed::next_case(&ed::text_range(&body, a, b)).to_string() } else { mode.clone() };
+        super::text::edit_text(s, move |body, t| {
             for pi in a.0..=b.0 {
                 let Some(para) = body.paragraphs.get_mut(pi) else { continue };
                 let n = para.char_len();
@@ -359,9 +375,23 @@ fn case(s: &mut Session, p: &Value) -> Result<Value> {
                     pos += len;
                 }
             }
+            if collapsed {
+                t.anchor = a;
+                t.caret = a;
+            }
         })?;
         return ok();
     }
+    let mode = if mode == "cycle" {
+        let all: String =
+            st.selection.shapes.iter().filter_map(|id| st.shape(*id)).filter_map(|sh| sh.text.as_ref()).map(|t| t.text()).collect::<Vec<_>>().join(
+                "
+",
+            );
+        ed::next_case(&all).to_string()
+    } else {
+        mode
+    };
     edit_shapes(s, &json!({}), "format.case", |sh| {
         if let Some(t) = sh.text.as_mut() {
             for para in &mut t.paragraphs {

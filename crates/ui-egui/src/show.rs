@@ -61,6 +61,10 @@ struct Transition {
     /// The slide left behind (Morph matches its shapes) and the Morph frame texture.
     from: Option<usize>,
     morph: Option<TextureHandle>,
+    /// Backgrounds and contents of the old and new slides, rendered once when the transition
+    /// moves contents over backgrounds (Pan, Ferris Wheel, Reveal…): old back, old content, new
+    /// back, new content.
+    parts: Option<[Option<TextureHandle>; 4]>,
     start: f64,
     kind: String,
     option: String,
@@ -138,7 +142,7 @@ impl Show {
                     self.last_viewed = from;
                 }
                 self.trans = if kind != "none" && dur > 0.0 && !doc.show.without_animation {
-                    Some(Transition { old, from, morph: None, start: now, kind, option, dur })
+                    Some(Transition { old, from, morph: None, parts: None, start: now, kind, option, dur })
                 } else {
                     None
                 };
@@ -202,22 +206,41 @@ fn fit(avail: Rect, doc: &Presentation) -> Rect {
     Rect::from_center_size(avail.center(), vec2(sw * s, sh * s))
 }
 
+/// A transition layer as an egui mesh: [`deckcraft_anim::layer_mesh`]'s triangles (perspective
+/// cards subdivided so their pictures stay straight) with per-vertex opacity.
 fn quad_mesh(tex: Option<egui::TextureId>, rect: Rect, l: &Layer, color: Color32) -> Mesh {
     let mut m = match tex {
         Some(id) => Mesh::with_texture(id),
         None => Mesh::default(),
     };
-    let a = (l.alpha.clamp(0.0, 1.0) * 255.0) as u8;
-    let col = if tex.is_some() { Color32::from_white_alpha(a) } else { color.gamma_multiply(l.alpha.clamp(0.0, 1.0) as f32) };
-    for k in 0..4 {
-        let q = l.quad.get(k).copied().unwrap_or([0.0, 0.0]);
-        let uv = l.uv.get(k).copied().unwrap_or([0.0, 0.0]);
-        let p = pos2(rect.min.x + q[0] as f32 * rect.width(), rect.min.y + q[1] as f32 * rect.height());
-        m.vertices.push(egui::epaint::Vertex { pos: p, uv: pos2(uv[0] as f32, uv[1] as f32), color: col });
+    let (verts, tris) = deckcraft_anim::layer_mesh(l);
+    for v in &verts {
+        let a = if v.a.is_finite() { v.a.clamp(0.0, 1.0) } else { 0.0 };
+        let col = if tex.is_some() { Color32::from_white_alpha((a * 255.0).round() as u8) } else { color.gamma_multiply(a as f32) };
+        let p = pos2(rect.min.x + v.pos[0] as f32 * rect.width(), rect.min.y + v.pos[1] as f32 * rect.height());
+        m.vertices.push(egui::epaint::Vertex { pos: p, uv: pos2(v.uv[0] as f32, v.uv[1] as f32), color: col });
     }
-    m.add_triangle(0, 1, 2);
-    m.add_triangle(0, 2, 3);
+    for t in tris {
+        m.add_triangle(t[0], t[1], t[2]);
+    }
     m
+}
+
+/// Render the backgrounds and contents of a transition's two slides into textures, once.
+fn part_textures(ctx: &egui::Context, doc: &Presentation, from: Option<usize>, to: usize, size: (u32, u32)) -> [Option<TextureHandle>; 4] {
+    use deckcraft_render::SlidePart;
+    let threads = if cfg!(target_arch = "wasm32") { 0 } else { std::thread::available_parallelism().map(|n| n.get().min(8) as u16).unwrap_or(0) };
+    let opts = RenderOpts { scale: size.0 as f64 / doc.slide_size.width.max(1.0), size: Some(size), threads, ..Default::default() };
+    let tex = |i: usize, part: SlidePart, name: &str| {
+        let img = deckcraft_render::render_slide_part(doc, i, part, &opts);
+        ctx.load_texture(name, crate::textures::to_color_image(&img, false), egui::TextureOptions::LINEAR)
+    };
+    [
+        from.map(|i| tex(i, SlidePart::Backdrop, "trans-old-back")),
+        from.map(|i| tex(i, SlidePart::Content, "trans-old-content")),
+        Some(tex(to, SlidePart::Backdrop, "trans-new-back")),
+        Some(tex(to, SlidePart::Content, "trans-new-content")),
+    ]
 }
 
 pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
@@ -470,18 +493,37 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
             tr.morph = Some(frame);
             drew = true;
             ctx.request_repaint();
-        } else if let (Some(tr), Some(new)) = (&show.trans, &tex) {
+        } else if let (Some(tr), Some(new)) = (show.trans.as_mut(), &tex) {
             let p = ((now - tr.start) / tr.dur.max(0.01)).clamp(0.0, 1.0);
             if p < 1.0 {
-                for l in deckcraft_anim::transition_layers(&tr.kind, &tr.option, p) {
+                // Slides split into background and content are rendered once per transition;
+                // every frame only composites cached textures.
+                if tr.parts.is_none() && deckcraft_anim::uses_slide_parts(&tr.kind, &tr.option) {
+                    tr.parts = Some(part_textures(&ctx, &doc, tr.from, idx, size));
+                }
+                let aspect = doc.slide_size.width / doc.slide_size.height.max(1.0);
+                let part = |k: usize| tr.parts.as_ref().and_then(|p| p.get(k).cloned().flatten());
+                let parts = [part(0), part(1), part(2), part(3)];
+                for l in deckcraft_anim::transition_frame(&tr.kind, &tr.option, p, aspect) {
+                    let old_or_black = |t: Option<&TextureHandle>| match t {
+                        Some(o) => quad_mesh(Some(o.id()), srect, &l, Color32::WHITE),
+                        None => quad_mesh(None, srect, &l, Color32::BLACK),
+                    };
                     let mesh = match l.source {
-                        Source::Old => match &tr.old {
-                            Some(o) => quad_mesh(Some(o.id()), srect, &l, Color32::WHITE),
-                            None => quad_mesh(None, srect, &l, Color32::BLACK),
-                        },
+                        Source::Old => old_or_black(tr.old.as_ref()),
                         Source::New => quad_mesh(Some(new.id()), srect, &l, Color32::WHITE),
                         Source::Black => quad_mesh(None, srect, &l, Color32::BLACK),
                         Source::White => quad_mesh(None, srect, &l, Color32::WHITE),
+                        Source::OldBack => old_or_black(parts[0].as_ref().or(tr.old.as_ref())),
+                        Source::NewBack => quad_mesh(Some(parts[2].as_ref().unwrap_or(new).id()), srect, &l, Color32::WHITE),
+                        Source::OldContent => match &parts[1] {
+                            Some(t) => quad_mesh(Some(t.id()), srect, &l, Color32::WHITE),
+                            None => continue,
+                        },
+                        Source::NewContent => match &parts[3] {
+                            Some(t) => quad_mesh(Some(t.id()), srect, &l, Color32::WHITE),
+                            None => continue,
+                        },
                     };
                     painter.add(egui::Shape::mesh(mesh));
                 }

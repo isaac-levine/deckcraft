@@ -63,7 +63,7 @@ pub static TRANSITIONS: &[(&str, &str, &str, u32, &[&str])] = &[
     ("fracture", "Fracture", "Exciting", 2000, &[]),
     ("crush", "Crush", "Exciting", 2000, &[]),
     ("peelOff", "Peel Off", "Exciting", 1500, &["l", "r"]),
-    ("pageCurlDouble", "Page Curl", "Exciting", 1500, &["l", "r"]),
+    ("pageCurlDouble", "Page Curl", "Exciting", 1500, &["l", "r", "singleL", "singleR"]),
     ("airplane", "Airplane", "Exciting", 2000, &["l", "r"]),
     ("origami", "Origami", "Exciting", 2000, &["l", "r"]),
     ("dissolve", "Dissolve", "Exciting", 1200, &[]),
@@ -72,9 +72,9 @@ pub static TRANSITIONS: &[(&str, &str, &str, u32, &[&str])] = &[
     ("clock", "Clock", "Exciting", 2000, &["clockwise", "counterClockwise", "wedge"]),
     ("ripple", "Ripple", "Exciting", 1400, &["center", "lu", "ru", "ld", "rd"]),
     ("honeycomb", "Honeycomb", "Exciting", 3000, &[]),
-    ("glitter", "Glitter", "Exciting", 2500, &["l", "r", "u", "d"]),
+    ("glitter", "Glitter", "Exciting", 2500, &["l", "r", "u", "d", "hexL", "hexR", "hexU", "hexD"]),
     ("vortex", "Vortex", "Exciting", 3000, &["l", "r", "u", "d"]),
-    ("shred", "Shred", "Exciting", 2000, &["strips", "particles"]),
+    ("shred", "Shred", "Exciting", 2000, &["stripsIn", "stripsOut", "particlesIn", "particlesOut"]),
     ("switch", "Switch", "Exciting", 1250, &["l", "r"]),
     ("flip", "Flip", "Exciting", 1250, &["l", "r"]),
     ("gallery", "Gallery", "Exciting", 1500, &["l", "r"]),
@@ -82,7 +82,7 @@ pub static TRANSITIONS: &[(&str, &str, &str, u32, &[&str])] = &[
     ("doors", "Doors", "Exciting", 1400, &["vert", "horz"]),
     ("box", "Box", "Exciting", 1250, &["l", "r", "u", "d"]),
     ("comb", "Comb", "Exciting", 1000, &["horz", "vert"]),
-    ("zoom", "Zoom", "Exciting", 1000, &["in", "out"]),
+    ("zoom", "Zoom", "Exciting", 1000, &["in", "out", "rotate"]),
     ("random", "Random", "Exciting", 2000, &[]),
     ("pan", "Pan", "Dynamic Content", 1000, &["u", "d", "l", "r"]),
     ("ferris", "Ferris Wheel", "Dynamic Content", 2000, &["l", "r"]),
@@ -92,6 +92,101 @@ pub static TRANSITIONS: &[(&str, &str, &str, u32, &[&str])] = &[
     ("orbit", "Orbit", "Dynamic Content", 2000, &["l", "r", "u", "d"]),
     ("flythrough", "Fly Through", "Dynamic Content", 1000, &["in", "out", "inBounce", "outBounce"]),
 ];
+
+/// The Effect Options label PowerPoint shows for a transition option. Options are stored as the
+/// file format's values: for moving transitions (Push, Wipe, Cover, Pan, Cube…) the direction
+/// things move, so "l" is the effect coming "From Right"; Glitter and the preset effects (Fall
+/// Over, Wind…) name the side itself; Ripple names where the wave heads.
+pub fn transition_option_label(kind: &str, option: &str) -> String {
+    let side = |c: char| match c {
+        'l' => "Left",
+        'r' => "Right",
+        'u' => "Top",
+        _ => "Bottom",
+    };
+    let opposite = |c: char| match c {
+        'l' => 'r',
+        'r' => 'l',
+        'u' => 'd',
+        _ => 'u',
+    };
+    let corner = |o: &str, flip: bool| -> Option<String> {
+        let mut cs = o.chars();
+        let (h, v) = (cs.next()?, cs.next()?);
+        let (h, v) = if flip { (opposite(h), opposite(v)) } else { (h, v) };
+        Some(format!("From {}-{}", side(v), side(h)))
+    };
+    let moving = matches!(
+        kind,
+        "push"
+            | "wipe"
+            | "cover"
+            | "uncover"
+            | "pan"
+            | "vortex"
+            | "cube"
+            | "box"
+            | "rotate"
+            | "orbit"
+            | "gallery"
+            | "conveyor"
+            | "ferris"
+            | "switch"
+            | "flip"
+    );
+    match (kind, option) {
+        (_, "horz") => "Horizontal".into(),
+        (_, "vert") => "Vertical".into(),
+        ("split", o) => format!("{} {}", if o.starts_with("horz") { "Horizontal" } else { "Vertical" }, if o.ends_with("In") { "In" } else { "Out" }),
+        ("fade" | "cut", "throughBlack") => "Through Black".into(),
+        ("fade", _) => "Smoothly".into(),
+        ("cut", _) => "Cut".into(),
+        ("clock", "counterClockwise") => "Counterclockwise".into(),
+        ("clock", "wedge") => "Wedge".into(),
+        ("clock", _) => "Clockwise".into(),
+        ("zoom", "rotate") => "Zoom and Rotate".into(),
+        ("ripple", "center") => "Center".into(),
+        ("ripple", o) => corner(o, true).unwrap_or_else(|| "Center".into()),
+        ("glitter", o) => {
+            let (pat, d) = match o.strip_prefix("hex") {
+                Some(d) => ("Hexagons", d.to_ascii_lowercase()),
+                None => ("Diamonds", o.to_string()),
+            };
+            format!("{pat} From {}", side(d.chars().next().unwrap_or('l')))
+        }
+        ("pageCurlDouble", o) => match o {
+            "singleL" => "Single Left".into(),
+            "singleR" => "Single Right".into(),
+            "r" => "Double Right".into(),
+            _ => "Double Left".into(),
+        },
+        ("shred", o) => {
+            format!("{} {}", if o.starts_with("particles") { "Particles" } else { "Strips" }, if o.ends_with("Out") { "Out" } else { "In" })
+        }
+        ("reveal", o) => format!(
+            "{} {}",
+            if o.starts_with("black") { "Through Black" } else { "Smoothly" },
+            if o.ends_with("Right") { "From Right" } else { "From Left" }
+        ),
+        ("flythrough", o) => {
+            format!("{}{}", if o.starts_with("out") { "Out" } else { "In" }, if o.ends_with("Bounce") { " with Bounce" } else { "" })
+        }
+        ("morph", o) => match o {
+            "words" => "Words".into(),
+            "characters" => "Characters".into(),
+            _ => "Objects".into(),
+        },
+        (_, o) if o.len() == 2 && moving => corner(o, true).unwrap_or_default(),
+        (_, o) if o.len() == 1 && moving => format!("From {}", side(opposite(o.chars().next().unwrap_or('l')))),
+        (_, "l") => "Left".into(),
+        (_, "r") => "Right".into(),
+        (_, "u") => "Top".into(),
+        (_, "d") => "Bottom".into(),
+        (_, "in") => "In".into(),
+        (_, "out") => "Out".into(),
+        (_, o) => o.to_string(),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -290,4 +385,30 @@ pub static ANIMATIONS: &[(&str, &str, AnimClass, u32, u32, &[&str])] = &[
 
 pub fn animation_info(effect: &str, class: AnimClass) -> Option<&'static (&'static str, &'static str, AnimClass, u32, u32, &'static [&'static str])> {
     ANIMATIONS.iter().find(|a| a.0 == effect && a.2 == class).or_else(|| ANIMATIONS.iter().find(|a| a.0 == effect))
+}
+
+#[cfg(test)]
+mod option_label_tests {
+    use super::*;
+
+    #[test]
+    fn transition_option_labels() {
+        assert_eq!(transition_option_label("push", "l"), "From Right");
+        assert_eq!(transition_option_label("push", "u"), "From Bottom");
+        assert_eq!(transition_option_label("wipe", "r"), "From Left");
+        assert_eq!(transition_option_label("cover", "ru"), "From Bottom-Left");
+        assert_eq!(transition_option_label("ripple", "ru"), "From Bottom-Left");
+        assert_eq!(transition_option_label("glitter", "hexU"), "Hexagons From Top");
+        assert_eq!(transition_option_label("glitter", "l"), "Diamonds From Left");
+        assert_eq!(transition_option_label("wind", "l"), "Left");
+        assert_eq!(transition_option_label("pageCurlDouble", "singleR"), "Single Right");
+        assert_eq!(transition_option_label("shred", "particlesOut"), "Particles Out");
+        assert_eq!(transition_option_label("zoom", "rotate"), "Zoom and Rotate");
+        assert_eq!(transition_option_label("split", "vertIn"), "Vertical In");
+        for (id, _, _, _, opts) in TRANSITIONS {
+            for o in opts.iter() {
+                assert!(!transition_option_label(id, o).is_empty(), "{id}/{o}");
+            }
+        }
+    }
 }

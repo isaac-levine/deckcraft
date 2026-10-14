@@ -63,6 +63,30 @@ fn shape_style_fill_resolves_through_theme() {
 }
 
 #[test]
+fn a_gradient_without_stops_takes_them_from_its_style() {
+    // `a:gradFill` with only a direction: PowerPoint fills it with the stops of the theme gradient
+    // the style's fillRef names, in the style's colour, along the shape's own direction.
+    let p = Presentation::default();
+    let s = &p.slides[0];
+    let ctx = Ctx::for_slide(&p, s).unwrap();
+    let own =
+        style::Gradient { tile: [0.0; 4], stops: vec![], shape: style::GradientShape::Linear { angle: 45.0, scaled: true }, rotate_with_shape: true };
+    let mut st = ShapeStyle::accent(SchemeSlot::Accent2);
+    st.fill_ref.0 = 3;
+    let sh = Shape { style: Some(st.clone()), fill: Some(Fill::Gradient(own.clone())), ..Default::default() };
+    let (f, ph) = resolve::fill(&ctx, &sh);
+    let Some(Fill::Gradient(g)) = f else { panic!("expected a gradient") };
+    let Some(Fill::Gradient(theme)) = p.masters[0].theme.format.fills.get(2).cloned() else { panic!("theme fill 3 is a gradient") };
+    assert_eq!(g.stops, theme.stops);
+    assert_eq!(g.shape, own.shape, "the shape's own direction");
+    assert_eq!(ph, Some(p.masters[0].theme.colors.get(SchemeSlot::Accent2)));
+    // A solid style fill has no stops to give: the gradient stays empty (draws nothing).
+    st.fill_ref.0 = 1;
+    let sh = Shape { style: Some(st), fill: Some(Fill::Gradient(own.clone())), ..Default::default() };
+    assert_eq!(resolve::fill(&ctx, &sh).0, Some(Fill::Gradient(own)));
+}
+
+#[test]
 fn serde_roundtrip() {
     let p = Presentation::default();
     let j = serde_json::to_string(&p).unwrap();
@@ -71,6 +95,25 @@ fn serde_roundtrip() {
     // Unknown and missing fields are tolerated.
     let q: Presentation = serde_json::from_str(r#"{"slides":[],"zzz":1}"#).unwrap();
     assert!(q.slides.is_empty());
+}
+
+#[test]
+fn alloc_id_stays_unique_when_next_id_is_at_the_maximum() {
+    let mut p = Presentation::default();
+    // A hostile or damaged file declares the largest id.
+    Arc::make_mut(&mut p.slides[0]).shapes[0].id = ShapeId(u32::MAX);
+    p.fix_next_id();
+    assert_eq!(p.next_id, u32::MAX);
+    let mut used = std::collections::HashSet::new();
+    p.each_id(&mut |id| {
+        used.insert(id);
+    });
+    for _ in 0..5 {
+        let id = p.alloc_id();
+        assert!(used.insert(id), "id {id} handed out twice");
+        // Give the id to a shape so the next allocation sees it as taken.
+        p.media.push(MediaItem { id: MediaId(id), ..Default::default() });
+    }
 }
 
 #[test]
@@ -158,4 +201,52 @@ fn hyperlinked_runs_take_the_theme_hyperlink_look() {
     assert_eq!((r.fill, r.underline.as_deref()), (red, Some("none")));
     let dbl = resolve::run(&ctx, title, &para, &RunProps { link, underline: Some("dbl".into()), ..Default::default() });
     assert_eq!((dbl.fill, dbl.underline.as_deref()), (hlink, Some("dbl")));
+}
+
+#[test]
+fn a_layout_colour_map_override_applies_to_its_slides() {
+    // A dark "section" layout maps bg1→dk1 and tx1→lt1; a slide on it that keeps the master
+    // mapping (`masterClrMapping`) follows the layout, as PowerPoint draws it.
+    let mut p = Presentation::default();
+    let dark: Vec<(String, String)> =
+        [("bg1", "dk1"), ("tx1", "lt1"), ("bg2", "dk2"), ("tx2", "lt2")].iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+    let layout = p.slides[0].layout;
+    let m = std::sync::Arc::make_mut(&mut p.masters[0]);
+    let colors = m.theme.colors.clone();
+    m.layouts.iter_mut().find(|l| l.id == layout).unwrap().color_map = Some(dark.clone());
+    let s: Slide = (*p.slides[0]).clone();
+    let ctx = Ctx::for_slide(&p, &s).unwrap();
+    assert_eq!(ctx.color(&ColorRef::scheme(SchemeSlot::Bg1), None), colors.get(SchemeSlot::Dk1));
+    assert_eq!(ctx.color(&ColorRef::scheme(SchemeSlot::Tx2), None), colors.get(SchemeSlot::Lt2));
+    assert_eq!(ctx.scheme.get(SchemeSlot::Lt1), colors.get(SchemeSlot::Dk1));
+    // The slide's own override wins over the layout's.
+    let mut own = s.clone();
+    own.color_map = Some([("bg1", "lt1"), ("tx1", "dk1")].iter().map(|(a, b)| (a.to_string(), b.to_string())).collect());
+    let ctx = Ctx::for_slide(&p, &own).unwrap();
+    assert_eq!(ctx.color(&ColorRef::scheme(SchemeSlot::Bg1), None), colors.get(SchemeSlot::Lt1));
+    // The layout itself draws with its override; the master keeps its own map.
+    let m = &p.masters[0];
+    let l = m.layout(layout).unwrap();
+    assert_eq!(Ctx::for_layout(&p, m, l).color(&ColorRef::scheme(SchemeSlot::Bg1), None), colors.get(SchemeSlot::Dk1));
+    assert_eq!(Ctx::for_master(&p, m).color(&ColorRef::scheme(SchemeSlot::Bg1), None), colors.get(SchemeSlot::Lt1));
+}
+
+#[test]
+fn sibling_lists_and_parents_reach_into_groups() {
+    let leaf = |id: u32| Shape { id: ShapeId(id), ..Default::default() };
+    let group = |id: u32, children: Vec<Shape>| Shape {
+        id: ShapeId(id),
+        kind: ShapeKind::Group { children, child: Default::default() },
+        ..Default::default()
+    };
+    let mut tree = vec![leaf(1), group(2, vec![leaf(3), group(4, vec![leaf(5)])]), leaf(6)];
+    assert_eq!(parent_of(&tree, ShapeId(1)), Some(None));
+    assert_eq!(parent_of(&tree, ShapeId(3)), Some(Some(ShapeId(2))));
+    assert_eq!(parent_of(&tree, ShapeId(5)), Some(Some(ShapeId(4))));
+    assert_eq!(parent_of(&tree, ShapeId(9)), None);
+    let ids = |v: &Vec<Shape>| v.iter().map(|s| s.id.0).collect::<Vec<_>>();
+    assert_eq!(sibling_list_mut(&mut tree, ShapeId(6)).map(|v| ids(v)), Some(vec![1, 2, 6]));
+    assert_eq!(sibling_list_mut(&mut tree, ShapeId(4)).map(|v| ids(v)), Some(vec![3, 4]));
+    assert_eq!(sibling_list_mut(&mut tree, ShapeId(5)).map(|v| ids(v)), Some(vec![5]));
+    assert!(sibling_list_mut(&mut tree, ShapeId(9)).is_none());
 }

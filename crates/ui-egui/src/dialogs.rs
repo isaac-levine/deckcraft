@@ -1,11 +1,11 @@
-//! Dialogs (Insert Table, Slide Size, Header & Footer, Hyperlink, Set Up Show, Zoom, …), the start
-//! screen and the About window.
+//! Dialogs (Insert Table, Slide Size, Header & Footer, Hyperlink, Set Up Show, Zoom, …) and the
+//! About window. The start screen is File › Home (`backstage.rs`).
 
 use egui::{Align2, Color32, CornerRadius, Rect, Sense, Stroke, Ui, pos2, vec2};
 use serde_json::{Value, json};
 
+use crate::SlideApp;
 use crate::theme::{self, Tokens};
-use crate::{SlideApp, ribbon};
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Dialog {
@@ -290,6 +290,37 @@ fn body(app: &mut SlideApp, ui: &mut Ui, d: &mut Dialog) -> bool {
             });
             done
         }
+        "close" => {
+            // File › Close and Ctrl+W on a presentation with unsaved changes.
+            let Some(name) = app.session.active().map(|d| d.title()) else { return true };
+            ui.label(egui::RichText::new(format!("Do you want to save the changes you made to “{name}”?")).strong());
+            ui.label("Your changes will be lost if you don't save them.");
+            ui.add_space(8.0);
+            let mut done = false;
+            ui.horizontal(|ui| {
+                let t = Tokens::get(ui.ctx());
+                if ui.add(egui::Button::new("Don't Save").min_size(vec2(84.0, 24.0))).clicked() {
+                    run(app, "file.close", json!({}));
+                    done = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let save = ui.add(egui::Button::new(egui::RichText::new("Save").color(t.accent_text)).fill(t.accent).min_size(vec2(72.0, 24.0)));
+                    if save.clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        app.save();
+                        // In the browser a save is a download: the presentation stays "unsaved".
+                        let web = app.services.pick_save.is_none() && app.services.download.is_some();
+                        if web || app.session.active().is_some_and(|d| !d.is_dirty()) {
+                            run(app, "file.close", json!({}));
+                        }
+                        done = true;
+                    }
+                    if ui.add(egui::Button::new("Cancel").min_size(vec2(72.0, 24.0))).clicked() {
+                        done = true;
+                    }
+                });
+            });
+            done
+        }
         "zoom" => {
             for pct in [400, 200, 150, 100, 75, 66, 50, 33] {
                 if ui.radio(false, format!("{pct}%")).clicked() {
@@ -430,45 +461,8 @@ fn body(app: &mut SlideApp, ui: &mut Ui, d: &mut Dialog) -> bool {
             };
             let (ok, cancel) = buttons(ui, "Export");
             if ok {
-                let name = app.session.active().map(|s| s.title()).unwrap_or_else(|| "Presentation".into());
-                let (ext, all) = match fmt.as_str() {
-                    "pdf" => ("pdf", false),
-                    "pngAll" => ("png", true),
-                    "jpeg" => ("jpg", false),
-                    "pptx" => ("pptx", false),
-                    "outline" => ("txt", false),
-                    _ => ("png", false),
-                };
-                let suggested = format!("{name}.{ext}");
-                if let Some(pick) = app.services.pick_save.as_mut() {
-                    if let Some(path) = pick(&suggested) {
-                        let mut params = json!({"path": path, "all": all});
-                        if ext == "pdf"
-                            && let (Some(o), Some(extra)) = (params.as_object_mut(), pdf_params.as_object())
-                        {
-                            o.extend(extra.clone());
-                        }
-                        let r = app.session.execute("file.export", &params);
-                        match r {
-                            Ok(_) => app.set_status(format!("Exported {path}")),
-                            Err(e) => app.set_status(e.to_string()),
-                        }
-                    }
-                } else if let (Some(dl), Some(s)) = (app.services.download.as_mut(), app.session.active()) {
-                    let bytes = match ext {
-                        "png" | "jpg" => {
-                            let img = deckcraft_render::render_slide(
-                                &s.doc,
-                                s.selection.slide,
-                                &deckcraft_render::RenderOpts { scale: 2.0, ..Default::default() },
-                            );
-                            if ext == "png" { img.to_png() } else { img.to_jpeg(92) }
-                        }
-                        "pdf" => deckcraft_pdf_bytes(&s.doc, &pdf_params),
-                        other => deckcraft_engine::cmd::file::save_bytes(&s.doc, other).unwrap_or_default(),
-                    };
-                    dl(&suggested, &bytes);
-                }
+                let extra = if fmt == "pdf" { pdf_params } else { json!({}) };
+                app.export_as(&fmt, extra);
             }
             ok || cancel
         }
@@ -834,130 +828,4 @@ pub fn paint_logo(p: &egui::Painter, r: Rect) {
         Color32::WHITE,
         Stroke::NONE,
     ));
-}
-
-/// The start screen (no presentation open): new from themes, open, recent files.
-pub fn start_screen(app: &mut SlideApp, ui: &mut Ui) {
-    let t = Tokens::get(ui.ctx());
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        ui.add_space(24.0);
-        ui.horizontal(|ui| {
-            ui.add_space(40.0);
-            let (r, _) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::hover());
-            paint_logo(ui.painter(), r);
-            ui.label(egui::RichText::new("DeckCraft").font(theme::bold(26.0)));
-        });
-        if app.home_open() {
-            let title = app.session.active().map(|d| d.title()).unwrap_or_default();
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.add_space(40.0);
-                if ui.button(format!("← Back to {title}")).on_hover_text("Esc").clicked() {
-                    let _ = app.run("app.home", json!({"on": false}));
-                }
-            });
-        }
-        ui.add_space(16.0);
-        ui.horizontal(|ui| {
-            ui.add_space(40.0);
-            ui.label(egui::RichText::new("New presentation").font(theme::bold(16.0)));
-        });
-        ui.add_space(8.0);
-        inset_wrapped(ui, |ui| {
-            for th in deckcraft_model::theme::builtin_themes() {
-                let (r, resp) = ui.allocate_exact_size(vec2(180.0, 128.0), Sense::click());
-                let tile = Rect::from_min_size(r.min, vec2(180.0, 101.0));
-                ribbon::paint_theme_tile(ui.painter(), tile, &th);
-                if resp.hovered() {
-                    ui.painter().rect_stroke(tile, CornerRadius::same(2), Stroke::new(2.0, t.accent), egui::StrokeKind::Outside);
-                }
-                ui.painter().text(pos2(r.min.x, r.max.y - 10.0), Align2::LEFT_CENTER, &th.name, theme::font(12.0), t.text);
-                if resp.clicked() {
-                    let _ = app.run("file.new", json!({"theme": th.name}));
-                }
-            }
-        });
-        ui.add_space(16.0);
-        ui.horizontal(|ui| {
-            ui.add_space(40.0);
-            if ui.button("Open…").clicked() {
-                let _ = app.run("app.openDialog", json!({}));
-            }
-            if ui.button("Open the sample deck").clicked()
-                && let Err(e) = deckcraft_engine::sample::open_sample(&mut app.session)
-            {
-                app.set_status(e.to_string());
-            }
-        });
-        if !app.ui.recent.is_empty() {
-            ui.add_space(16.0);
-            ui.horizontal(|ui| {
-                ui.add_space(40.0);
-                ui.label(egui::RichText::new("Recent").font(theme::bold(16.0)));
-            });
-            for p in app.ui.recent.clone() {
-                ui.horizontal(|ui| {
-                    ui.add_space(40.0);
-                    if ui.link(&p).clicked()
-                        && let Err(e) = app.open_path(&p)
-                    {
-                        app.set_status(e);
-                    }
-                });
-            }
-        }
-        ui.add_space(30.0);
-        ui.horizontal(|ui| {
-            ui.add_space(40.0);
-            ui.hyperlink_to("Join the ArtCraft community on Discord", deckcraft_engine::links::DISCORD);
-        });
-    });
-}
-
-/// Wrapped rows that all start 40 points in from the left, in line with the start screen's
-/// headings. The inset is a margin on the container: an `add_space` inside `horizontal_wrapped`
-/// would indent only the first row.
-fn inset_wrapped(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
-    egui::Frame::NONE.inner_margin(egui::Margin { left: 40, ..Default::default() }).show(ui, |ui| {
-        ui.horizontal_wrapped(add_contents);
-    });
-}
-
-/// PDF bytes with the export dialog's options (web: downloaded instead of written).
-fn deckcraft_pdf_bytes(doc: &deckcraft_model::Presentation, params: &serde_json::Value) -> Vec<u8> {
-    deckcraft_engine::cmd::file::pdf_bytes(doc, params).unwrap_or_default()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::cell::{Cell, RefCell};
-
-    /// Start screen theme tiles that wrap onto a second row keep the 40-point inset (#17).
-    #[test]
-    fn inset_wrapped_indents_every_row() {
-        let left = Cell::new(0.0_f32);
-        let tiles = RefCell::new(Vec::<Rect>::new());
-        let mut harness = egui_kittest::Harness::builder().with_size(vec2(500.0, 400.0)).build_ui(|ui| {
-            left.set(ui.max_rect().left());
-            tiles.borrow_mut().clear();
-            inset_wrapped(ui, |ui| {
-                for _ in 0..4 {
-                    let (r, _) = ui.allocate_exact_size(vec2(180.0, 128.0), Sense::click());
-                    tiles.borrow_mut().push(r);
-                }
-            });
-        });
-        harness.run();
-        let tiles = tiles.borrow().clone();
-        let first_top = tiles.first().map_or(0.0, |r| r.top());
-        assert!(tiles.iter().any(|r| r.top() > first_top), "tiles should wrap onto a second row: {tiles:?}");
-        let mut row_top = f32::NEG_INFINITY;
-        for r in &tiles {
-            if r.top() > row_top {
-                row_top = r.top();
-                assert!((r.left() - (left.get() + 40.0)).abs() < 0.5, "row starts at {} instead of {}", r.left(), left.get() + 40.0);
-            }
-        }
-    }
 }

@@ -4,7 +4,7 @@ members = ["crates/*", "apps/*", "xtask"]
 default-members = ["crates/*", "apps/deckcraft", "apps/deckcraft-cli"]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.90"
@@ -14,6 +14,7 @@ repository = "https://github.com/storytold/deckcraft"
 # internal
 deckcraft-geom = { path = "crates/geom" }
 deckcraft-color = { path = "crates/color" }
+deckcraft-metafile = { path = "crates/metafile" }
 deckcraft-model = { path = "crates/model" }
 deckcraft-fonts = { path = "crates/fonts" }
 deckcraft-text = { path = "crates/text" }

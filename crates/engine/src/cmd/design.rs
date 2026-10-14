@@ -483,6 +483,7 @@ fn insert_layout(s: &mut Session, p: &Value) -> Result<Value> {
                 background: None,
                 show_master_shapes: true,
                 preserve: true,
+                color_map: None,
                 raw_ext: None,
             },
         );

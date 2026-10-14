@@ -1,6 +1,10 @@
 //! The slide canvas: the rendered slide, zoom and fit, pointer input routed to the engine's tools,
 //! and the overlays drawn on top (selection box and handles, smart guides, marquee, drawing
 //! previews, the text caret and text selection).
+//!
+//! As in PowerPoint's Normal view, shapes, pictures and text that sit partly or wholly off the
+//! slide are drawn on the area around it (the pasteboard), where they can be selected and moved;
+//! the slide show, exports and thumbnails clip to the slide.
 
 use deckcraft_engine::tools::{Hit, box_handles};
 use deckcraft_engine::{Mods, PointerEvent, PointerKind, Target, ToolKind};
@@ -108,18 +112,26 @@ pub fn show(app: &mut SlideApp, ui: &mut Ui) {
     crate::media::gif_repaint(ui.ctx(), &gifs);
     let times: Vec<_> = gifs.iter().map(|g| (g.id, g.t)).collect();
     let st = app.session.active();
+    // One texture pixel in screen points, and the canvas in pixels from the slide's corner.
+    let pixel = vec2(slide_rect.width() / px.0 as f32, slide_rect.height() / px.1 as f32);
+    let visible = visible_region(avail, slide_rect, pixel);
     let tex = match st.map(|d| (d.selection.target, d)) {
         Some((Target::Slides, d)) => {
             let idx = d.selection.slide;
             let doc = d.doc.clone();
-            app.textures.slide(ui.ctx(), &doc, idx, px, true, crate::media::gif_key(&gifs), app.ui.grayscale, &times)
+            app.textures.slide(ui.ctx(), &doc, idx, px, visible, true, crate::media::gif_key(&gifs), app.ui.grayscale, &times)
         }
-        Some((Target::Master { master }, d)) => master_tex(ui.ctx(), &d.doc, master, None, px),
-        Some((Target::Layout { master, layout }, d)) => master_tex(ui.ctx(), &d.doc, master, Some(layout), px),
+        Some((Target::Master { master }, d)) => master_tex(ui.ctx(), &d.doc, master, None, px, visible),
+        Some((Target::Layout { master, layout }, d)) => master_tex(ui.ctx(), &d.doc, master, Some(layout), px, visible),
         None => None,
     };
-    if let Some(tex) = tex {
-        painter.image(tex.id(), slide_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+    if let Some((tex, region)) = tex {
+        let at = Rect::from_min_size(
+            slide_rect.min + vec2(region.x as f32 * pixel.x, region.y as f32 * pixel.y),
+            vec2(region.w as f32 * pixel.x, region.h as f32 * pixel.y),
+        );
+        app.canvas_region = Some(at);
+        painter.image(tex.id(), at, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
     }
     app.perf.render_ms = app.textures.last_render_ms;
     media_frames(app, &painter, xf);
@@ -152,9 +164,67 @@ pub fn show(app: &mut SlideApp, ui: &mut Ui) {
     }
     pointer(app, ui, &resp, xf);
     overlays(app, ui, &painter, xf, &t);
+    ime_output(app, ui, xf);
     media_bar(app, ui, xf);
     gif_buttons(app, ui, xf, &gifs);
     context_menu(app, &resp);
+}
+
+/// The canvas `avail` in texture pixels (`pixel`: one pixel's size in points) from the slide's
+/// top-left corner.
+fn visible_region(avail: Rect, slide: Rect, pixel: egui::Vec2) -> deckcraft_render::Region {
+    let px = |v: f32, k: f32| if v.is_finite() && k > 0.0 { (v / k) as f64 } else { 0.0 };
+    let (x0, y0) = (px(avail.min.x - slide.min.x, pixel.x).floor(), px(avail.min.y - slide.min.y, pixel.y).floor());
+    let (x1, y1) = (px(avail.max.x - slide.min.x, pixel.x).ceil(), px(avail.max.y - slide.min.y, pixel.y).ceil());
+    let lim = i32::MAX as f64 / 4.0;
+    let (x0, y0) = (x0.clamp(-lim, lim), y0.clamp(-lim, lim));
+    deckcraft_render::Region {
+        x: x0 as i32,
+        y: y0 as i32,
+        w: (x1 - x0).clamp(1.0, u32::MAX as f64) as u32,
+        h: (y1 - y0).clamp(1.0, u32::MAX as f64) as u32,
+    }
+}
+
+/// Where an input method composes for the slide (#101), on screen: at the insertion point while
+/// editing text, or over the one selected shape (typing on it starts editing). `None` when there is
+/// nothing to type into.
+pub fn ime_area(app: &SlideApp, xf: Xf) -> Option<Rect> {
+    let st = app.session.active()?;
+    if let Some(ts) = &st.selection.text {
+        if ts.notes {
+            return None;
+        }
+        if let Some((top, bot)) = deckcraft_engine::cmd::text::caret_line(st, ts) {
+            return Some(Rect::from_two_pos(xf.to_screen(top), xf.to_screen(bot)).expand2(vec2(1.0, 0.0)));
+        }
+        let sh = st.shape(ts.shape)?;
+        return Some(screen_rect(xf, &deckcraft_engine::cmd::xfrm_of(&st.doc, &st.selection, sh)));
+    }
+    if st.selection.shapes.len() != 1 {
+        return None;
+    }
+    let sh = st.shape(*st.selection.shapes.first()?)?;
+    if sh.is_line() {
+        return None;
+    }
+    Some(screen_rect(xf, &deckcraft_engine::cmd::xfrm_of(&st.doc, &st.selection, sh)))
+}
+
+/// Turn the input method on for the slide while it takes typing, with its candidate window at
+/// the insertion point (#101). Without this egui leaves it off, and a Korean keyboard types
+/// separate jamo (ㅇ ㅏ ㄴ) instead of syllables. A focused text field sets its own.
+fn ime_output(app: &SlideApp, ui: &Ui, xf: Xf) {
+    let ctx = ui.ctx();
+    if ctx.memory(|m| m.focused().is_some()) || app.dialog.as_ref().is_some_and(|d| d.modal()) || app.palette.is_some() || app.backstage_open() {
+        return;
+    }
+    let Some(r) = ime_area(app, xf) else { return };
+    let to_global = ctx.layer_transform_to_global(ui.layer_id()).unwrap_or_default();
+    let r = to_global * r;
+    ctx.output_mut(|o| {
+        o.ime = Some(egui::output::IMEOutput { purpose: egui::IMEPurpose::Normal, rect: r, cursor_rect: r, should_interrupt_composition: false });
+    });
 }
 
 /// Play/pause on an animated GIF under the pointer or selected on its own.
@@ -240,14 +310,17 @@ fn master_tex(
     master: usize,
     layout: Option<usize>,
     px: (u32, u32),
-) -> Option<egui::TextureHandle> {
+    visible: deckcraft_render::Region,
+) -> Option<(egui::TextureHandle, deckcraft_render::Region)> {
+    let scale = px.0 as f64 / doc.slide_size.width.max(1.0);
+    let region = deckcraft_render::pasteboard_region(px, scale, deckcraft_render::layout_extent(doc, master, layout), visible);
     let img = deckcraft_render::render_layout(
         doc,
         master,
         layout,
-        &deckcraft_render::RenderOpts { scale: px.0 as f64 / doc.slide_size.width.max(1.0), edit: true, size: Some(px), ..Default::default() },
+        &deckcraft_render::RenderOpts { scale, edit: true, offset: region.offset(), size: Some(region.size()), ..Default::default() },
     );
-    Some(ctx.load_texture("master-canvas", crate::textures::to_color_image(&img, false), egui::TextureOptions::LINEAR))
+    Some((ctx.load_texture("master-canvas", crate::textures::to_color_image(&img, false), egui::TextureOptions::LINEAR), region))
 }
 
 fn ruler(p: &egui::Painter, avail: Rect, slide: Rect, scale: f32, t: &Tokens) {
@@ -388,6 +461,13 @@ fn overlays(app: &mut SlideApp, ui: &Ui, painter: &egui::Painter, xf: Xf, t: &To
         } else {
             poly(painter, corners, sel_stroke);
         }
+        if sh.locked && !editing_this {
+            // Locked: greyed handles that don't respond, no rotate or adjust handles.
+            for h in box_handles(&x).0 {
+                painter.circle(xf.to_screen(h), 4.0, t.text_faint, Stroke::new(1.0, t.handle_fill));
+            }
+            continue;
+        }
         if st.selection.shapes.len() == 1 || !editing_this {
             let (hs, rot) = box_handles(&x);
             let rot_s = xf.to_screen(rot);
@@ -422,12 +502,16 @@ fn overlays(app: &mut SlideApp, ui: &Ui, painter: &egui::Painter, xf: Xf, t: &To
             let pts = [Point::new(r.x0, r.y0), Point::new(r.x1, r.y0), Point::new(r.x1, r.y1), Point::new(r.x0, r.y1)].map(|q| xf.to_screen(m * q));
             painter.add(egui::Shape::convex_polygon(pts.to_vec(), t.text_selection, Stroke::NONE));
         }
+        // An input method's composition: underlined in place, thicker under the part being converted.
+        for (a, b, thick) in deckcraft_engine::cmd::text::composition_underlines(st) {
+            painter.line_segment([xf.to_screen(a), xf.to_screen(b)], Stroke::new(if thick { 2.0 } else { 1.0 }, t.caret));
+        }
         if !ts.is_range() {
             let blink = (ui.input(|i| i.time) * 1.6).fract() < 0.6;
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
-            if blink && let Some((cx, top, bot)) = l.caret(deckcraft_text::Pos { para: ts.caret.0, ch: ts.caret.1 }) {
-                let (p0, p1) = (xf.to_screen(m * Point::new(cx, top)), xf.to_screen(m * Point::new(cx, bot)));
-                painter.line_segment([p0, p1], Stroke::new(1.5, t.caret));
+            // An empty placeholder shows the caret where typing begins too.
+            if blink && let Some((top, bot)) = deckcraft_engine::cmd::text::caret_line(st, ts) {
+                painter.line_segment([xf.to_screen(top), xf.to_screen(bot)], Stroke::new(1.5, t.caret));
             }
         }
     }
@@ -563,6 +647,11 @@ fn context_menu(app: &mut SlideApp, resp: &egui::Response) {
                 crate::ribbon::menu_item(app, ui, crate::icons::Icon::Group, "Group", "arrange.group", json!({}));
                 crate::ribbon::menu_item(app, ui, crate::icons::Icon::Ungroup, "Ungroup", "arrange.ungroup", json!({}));
             });
+            let locked = app.session.active().is_some_and(|d| d.selected_shapes().iter().all(|s| s.locked));
+            if ui.button(if locked { "Unlock" } else { "Lock" }).clicked() {
+                let _ = app.run("shape.lock", json!({"locked": !locked}));
+                ui.close();
+            }
             if ui.button("Link…").clicked() {
                 app.dialog = Some(crate::dialogs::Dialog::new("hyperlink"));
                 ui.close();

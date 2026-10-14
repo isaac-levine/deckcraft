@@ -37,3 +37,7 @@ sync_github_name = false
 
 [people.Johannesgauss]
 sync_github_name = true
+
+[people.Silvertree2010]
+display_name = "Netter"
+sync_github_name = false

@@ -76,7 +76,15 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("shape.rename", "Rename", ["Selection Pane"], None, "{name, id?}", has_selection, rename),
         cmd!("shape.altText", "Alt Text", ["Shape Format", "Accessibility"], None, "{text, decorative?: bool, ids?}", has_selection, alt_text),
         cmd!("shape.visible", "Show/Hide", ["Selection Pane"], None, "{visible?: bool, ids?}", has_selection, visible),
-        cmd!("shape.lock", "Lock", [], None, "{locked?: bool, ids?}", has_selection, lock),
+        cmd!(
+            "shape.lock",
+            "Lock",
+            ["Selection Pane"],
+            None,
+            "{locked?: bool (default: toggle), ids?} (a group locks or unlocks with everything in it)",
+            has_selection,
+            lock
+        ),
         cmd!("shape.setDefault", "Set as Default Shape", [], None, "{}", has_selection, set_default),
         cmd!("picture.crop", "Crop", ["Picture Format", "Size"], None, "{left?, top?, right?, bottom?: fraction 0..1, ids?}", has_selection, crop),
         cmd!(
@@ -113,7 +121,7 @@ pub fn specs() -> Vec<CommandSpec> {
 fn move_by(s: &mut Session, p: &Value) -> Result<Value> {
     let (dx, dy) = (f64_param(p, "dx"), f64_param(p, "dy"));
     let (ax, ay) = (f64_param(p, "x"), f64_param(p, "y"));
-    edit_shapes(s, p, "shape.move", |sh| {
+    edit_geometry(s, p, "shape.move", |sh| {
         if let Some(x) = sh.xfrm.as_mut() {
             x.x = ax.unwrap_or(x.x) + dx.unwrap_or(0.0);
             x.y = ay.unwrap_or(x.y) + dy.unwrap_or(0.0);
@@ -125,7 +133,7 @@ fn move_by(s: &mut Session, p: &Value) -> Result<Value> {
 fn resize(s: &mut Session, p: &Value) -> Result<Value> {
     let (w, h) = (f64_param(p, "w").map(|v| v.max(0.0)), f64_param(p, "h").map(|v| v.max(0.0)));
     let lock = bool_or(p, "lockAspect", false);
-    edit_shapes(s, p, "shape.resize", |sh| {
+    edit_geometry(s, p, "shape.resize", |sh| {
         if let Some(x) = sh.xfrm.as_mut() {
             let ar = if x.h > 0.0 { x.w / x.h } else { 1.0 };
             let (cx, cy) = (x.x + x.w / 2.0, x.y + x.h / 2.0);
@@ -154,7 +162,7 @@ fn resize(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn set_bounds(s: &mut Session, p: &Value) -> Result<Value> {
-    edit_shapes(s, p, "shape.setBounds", |sh| {
+    edit_geometry(s, p, "shape.setBounds", |sh| {
         if let Some(x) = sh.xfrm.as_mut() {
             x.x = f64_param(p, "x").unwrap_or(x.x);
             x.y = f64_param(p, "y").unwrap_or(x.y);
@@ -167,7 +175,7 @@ fn set_bounds(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn rotate(s: &mut Session, p: &Value) -> Result<Value> {
     let (abs, by) = (f64_param(p, "deg"), f64_param(p, "by"));
-    edit_shapes(s, p, "shape.rotate", |sh| {
+    edit_geometry(s, p, "shape.rotate", |sh| {
         if let Some(x) = sh.xfrm.as_mut() {
             let r = abs.unwrap_or(x.rot) + by.unwrap_or(0.0);
             x.rot = ((r % 360.0) + 360.0) % 360.0;
@@ -178,7 +186,7 @@ fn rotate(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn flip(s: &mut Session, p: &Value) -> Result<Value> {
     let v = str_param(p, "axis").unwrap_or("horizontal").starts_with('v');
-    edit_shapes(s, p, "shape.flip", |sh| {
+    edit_geometry(s, p, "shape.flip", |sh| {
         if let Some(x) = sh.xfrm.as_mut() {
             if v {
                 x.flip_v = !x.flip_v;
@@ -193,7 +201,7 @@ fn flip(s: &mut Session, p: &Value) -> Result<Value> {
 fn adjust(s: &mut Session, p: &Value) -> Result<Value> {
     let i = usize_param(p, "index").unwrap_or(0).min(16);
     let v = f64_param(p, "value").ok_or_else(|| bad("shape.adjust", "missing `value`"))?;
-    edit_shapes(s, p, "shape.adjust", |sh| {
+    edit_geometry(s, p, "shape.adjust", |sh| {
         if let Geom::Preset { name, adj } = &mut sh.geom {
             let defaults = deckcraft_geom::preset::info(name).map(|x| x.defaults).unwrap_or(&[]);
             while adj.len() <= i {
@@ -211,7 +219,7 @@ fn adjust(s: &mut Session, p: &Value) -> Result<Value> {
 fn change(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_param(p, "preset").ok_or_else(|| bad("shape.change", "missing `preset`"))?;
     let info = deckcraft_geom::preset::info(name).ok_or_else(|| bad("shape.change", format!("unknown preset `{name}`")))?;
-    edit_shapes(s, p, "shape.change", |sh| {
+    edit_geometry(s, p, "shape.change", |sh| {
         sh.geom = Geom::preset(info.name);
         Ok(())
     })
@@ -253,7 +261,7 @@ pub(crate) fn gradient_param(v: &Value) -> Option<Gradient> {
             scaled: false,
         },
     };
-    Some(Gradient { stops, shape, rotate_with_shape: v.get("rotateWithShape").and_then(Value::as_bool).unwrap_or(true) })
+    Some(Gradient { tile: [0.0; 4], stops, shape, rotate_with_shape: v.get("rotateWithShape").and_then(Value::as_bool).unwrap_or(true) })
 }
 
 fn fill(s: &mut Session, p: &Value) -> Result<Value> {
@@ -570,12 +578,28 @@ fn visible(s: &mut Session, p: &Value) -> Result<Value> {
     })
 }
 
+/// Lock: a locked object can be selected, formatted and typed in, but not moved, sized, rotated,
+/// flipped, reshaped or cropped. Locking or unlocking a group does the same to everything in it
+/// (a child can still be unlocked on its own afterwards), as PowerPoint does.
 fn lock(s: &mut Session, p: &Value) -> Result<Value> {
     let v = bool_param(p, "locked");
     edit_shapes(s, p, "shape.lock", |sh| {
-        sh.locked = v.unwrap_or(!sh.locked);
+        let to = v.unwrap_or(!sh.locked);
+        set_locked(sh, to, 0);
         Ok(())
     })
+}
+
+fn set_locked(sh: &mut deckcraft_model::Shape, to: bool, depth: usize) {
+    sh.locked = to;
+    if depth > 64 {
+        return;
+    }
+    if let Some(children) = sh.children_mut() {
+        for c in children {
+            set_locked(c, to, depth + 1);
+        }
+    }
 }
 
 fn set_default(s: &mut Session, _p: &Value) -> Result<Value> {
@@ -595,7 +619,7 @@ fn set_default(s: &mut Session, _p: &Value) -> Result<Value> {
 
 fn crop(s: &mut Session, p: &Value) -> Result<Value> {
     let c = [f64_param(p, "left"), f64_param(p, "top"), f64_param(p, "right"), f64_param(p, "bottom")];
-    edit_shapes(s, p, "picture.crop", |sh| {
+    edit_geometry(s, p, "picture.crop", |sh| {
         if let deckcraft_model::ShapeKind::Picture { fill } = &mut sh.kind {
             for (i, v) in c.iter().enumerate() {
                 if let (Some(v), Some(slot)) = (v, fill.crop.get_mut(i)) {

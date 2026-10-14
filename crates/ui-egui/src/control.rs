@@ -73,7 +73,8 @@ pub fn inspect(app: &SlideApp, ctx: &egui::Context) -> Value {
         "slideRect": app.slide_rect.map(|c| json!([c.left(), c.top(), c.width(), c.height()])),
         "canvasScale": app.canvas_scale,
         "dialog": app.dialog.as_ref().map(|d| d.id.clone()),
-        "home": app.home_open(),
+        "home": app.backstage_open(),
+        "backstage": app.backstage.as_ref().map(|b| b.page.id()),
         "showing": app.show.as_ref().map(|s| json!({"slide": s.state.slide, "step": s.state.step, "ended": s.ended})),
         "documents": app.session.documents().iter().map(|d| json!({"title": d.title(), "dirty": d.is_dirty(), "path": d.path})).collect::<Vec<_>>(),
         "status": app.status.as_ref().map(|s| s.0.clone()),
@@ -146,6 +147,23 @@ pub fn handle(app: &mut SlideApp, ctx: &egui::Context, req: &ControlRequest) -> 
         "ui.text" => {
             let Some(t) = s("text") else { return err("missing `text`") };
             wrap(app.session.type_text(t).map_err(|e| e.to_string()))
+        }
+        "ui.ime" => {
+            // An input method's event, through egui like a real one: it reaches the slide's text
+            // or a focused text field (#101).
+            let ev = if let Some(t) = s("commit") {
+                egui::ImeEvent::Commit(t.into())
+            } else if let Some(t) = s("preedit") {
+                let active = p.get("active").and_then(Value::as_array).and_then(|a| {
+                    let (x, y) = (a.first()?.as_u64()? as usize, a.get(1)?.as_u64()? as usize);
+                    (x <= y).then_some(x..y)
+                });
+                egui::ImeEvent::Preedit { text: t.into(), active_range_chars: active }
+            } else {
+                return err("missing `preedit` or `commit`");
+            };
+            app.synthetic.push(egui::Event::Ime(ev));
+            ok(json!({"queued": true}))
         }
         "ui.tool.select" => {
             let Some(name) = s("tool") else { return err("missing `tool`") };

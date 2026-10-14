@@ -14,7 +14,7 @@ use std::sync::Arc;
 use deckcraft_geom::{Size, emu_to_pt};
 use deckcraft_model::text::TextBody;
 use deckcraft_model::{
-    Background, Comment, CustomShow, HeaderFooter, Layout, LayoutId, LayoutType, Master, MasterId, MediaId, MediaItem, PhType, Presentation,
+    Background, Comment, CustomShow, Geom, HeaderFooter, Layout, LayoutId, LayoutType, Master, MasterId, MediaId, MediaItem, PhType, Presentation,
     Properties, Section, ShowSettings, Slide, SlideId, defaults,
 };
 
@@ -30,6 +30,8 @@ pub struct Imp<'a> {
     pub next: u32,
     pub slide_by_part: HashMap<String, SlideId>,
     pub custom_show_names: HashMap<String, String>,
+    /// GUIDs (upper case) of the table styles the file defines.
+    pub table_style_ids: Vec<String>,
 }
 
 impl Imp<'_> {
@@ -230,6 +232,7 @@ pub fn import(bytes: &[u8]) -> Result<Presentation, PptxError> {
         next: max_id.max(1),
         slide_by_part: HashMap::new(),
         custom_show_names: HashMap::new(),
+        table_style_ids: Vec::new(),
     };
     // Slide ids first so hyperlinks anywhere can point at slides.
     let mut slide_ids: Vec<(u32, String, SlideId)> = vec![];
@@ -268,6 +271,13 @@ pub fn import(bytes: &[u8]) -> Result<Presentation, PptxError> {
     p.first_slide_number = pres_el.u32("firstSlideNum").unwrap_or(1).min(9999);
     if let Some(dts) = pres_el.child("defaultTextStyle") {
         p.default_text_style = dml::list_style(&mut imp, &pres_part, dts);
+    }
+    if let Some(r) = pres_part.rels.first_of("tableStyles")
+        && let Some(d) = load(&pkg, &r.target)
+    {
+        let part = Part::new(&pkg, &r.target, &d);
+        p.table_styles = table_styles(&mut imp, &part, &d.root);
+        imp.table_style_ids = p.table_styles.iter().map(|s| s.id.clone()).collect();
     }
 
     // Masters and layouts.
@@ -387,6 +397,7 @@ pub fn import(bytes: &[u8]) -> Result<Presentation, PptxError> {
         p.props.company = d.root.child("Company").map(|c| c.text()).unwrap_or_default();
     }
 
+    inherit_placeholder_geometry(&mut p);
     p.header_footer = header_footer(&p);
     p.media = std::mem::take(&mut imp.media);
     p.next_id = imp.next;
@@ -417,6 +428,154 @@ pub fn has_rel_refs(el: &El) -> bool {
 
 pub fn color_map(cm: &El) -> Vec<(String, String)> {
     cm.attrs.iter().filter(|(k, _)| !k.starts_with("xmlns")).map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
+/// Placeholders read without a geometry (an empty custom geometry, see `shapes::sp`) take the
+/// geometry of the layout or master placeholder they inherit from, as PowerPoint draws them: a
+/// layout's picture placeholder cut into a shape keeps that shape on the slide. Anything left
+/// is a rectangle.
+fn inherit_placeholder_geometry(p: &mut Presentation) {
+    let unset = |g: &Geom| matches!(g, Geom::Custom { paths } if paths.is_empty());
+    // Masters first, then layouts (from their masters), then slides (from layouts and masters).
+    for m in &mut p.masters {
+        let m = Arc::make_mut(m);
+        walk_shapes_mut(&mut m.shapes, &mut |s| {
+            if unset(&s.geom) {
+                s.geom = Geom::default();
+            }
+        });
+    }
+    let mut layout_geoms: Vec<(LayoutId, usize, Geom)> = vec![];
+    for m in &p.masters {
+        for l in &m.layouts {
+            let ctx = deckcraft_model::resolve::Ctx::for_layout(p, m, l);
+            for (i, s) in l.shapes.iter().enumerate() {
+                if unset(&s.geom) {
+                    let (_, mp) = deckcraft_model::resolve::parents(&ctx, s);
+                    layout_geoms.push((l.id, i, mp.map(|m| m.geom.clone()).filter(|g| !unset(g)).unwrap_or_default()));
+                }
+            }
+        }
+    }
+    for m in &mut p.masters {
+        let m = Arc::make_mut(m);
+        for l in &mut m.layouts {
+            for (id, i, g) in layout_geoms.iter().filter(|(id, _, _)| *id == l.id) {
+                let _ = id;
+                if let Some(s) = l.shapes.get_mut(*i) {
+                    s.geom = g.clone();
+                }
+            }
+        }
+    }
+    let mut slide_geoms: Vec<(usize, usize, Geom)> = vec![];
+    for (si, sl) in p.slides.iter().enumerate() {
+        let Some(ctx) = deckcraft_model::resolve::Ctx::for_slide(p, sl) else { continue };
+        for (i, s) in sl.shapes.iter().enumerate() {
+            if unset(&s.geom) {
+                let (lp, mp) = deckcraft_model::resolve::parents(&ctx, s);
+                let g = lp.map(|l| l.geom.clone()).filter(|g| !unset(g)).or_else(|| mp.map(|m| m.geom.clone()).filter(|g| !unset(g)));
+                slide_geoms.push((si, i, g.unwrap_or_default()));
+            }
+        }
+    }
+    for (si, i, g) in slide_geoms {
+        if let Some(sl) = p.slides.get_mut(si)
+            && let Some(s) = Arc::make_mut(sl).shapes.get_mut(i)
+        {
+            s.geom = g;
+        }
+    }
+    // Placeholders inside groups (rare) and anything still unset: rectangles.
+    for sl in &mut p.slides {
+        walk_shapes_mut(&mut Arc::make_mut(sl).shapes, &mut |s| {
+            if unset(&s.geom) {
+                s.geom = Geom::default();
+            }
+        });
+    }
+    for m in &mut p.masters {
+        for l in &mut Arc::make_mut(m).layouts {
+            walk_shapes_mut(&mut l.shapes, &mut |s| {
+                if unset(&s.geom) {
+                    s.geom = Geom::default();
+                }
+            });
+        }
+    }
+}
+
+/// Every shape, groups included.
+fn walk_shapes_mut(shapes: &mut [deckcraft_model::Shape], f: &mut dyn FnMut(&mut deckcraft_model::Shape)) {
+    for s in shapes {
+        f(s);
+        if let deckcraft_model::ShapeKind::Group { children, .. } = &mut s.kind {
+            walk_shapes_mut(children, f);
+        }
+    }
+}
+
+/// `a:tblStyleLst`: the table styles the file defines.
+fn table_styles(imp: &mut Imp, part: &Part, root: &El) -> Vec<deckcraft_model::table::TableStyleDef> {
+    use deckcraft_model::table::{TableBorder, TablePart, TablePartStyle, TableStyleDef};
+    root.children_named("tblStyle")
+        .take(256)
+        .filter_map(|st| {
+            let id = st.attr("styleId")?.to_ascii_uppercase();
+            let mut def = TableStyleDef { id, name: st.attr("styleName").unwrap_or("").to_string(), raw: part.keep(st), ..Default::default() };
+            if let Some(bg) = st.child("tblBg") {
+                let mut ps = TablePartStyle::default();
+                if let Some(f) = bg.elements().find(|e| e.local().ends_with("Fill")) {
+                    ps.fill = dml::fill_el(imp, part, f);
+                }
+                if let Some(fr) = bg.child("fillRef") {
+                    ps.fill_ref = Some((
+                        fr.u32("idx").unwrap_or(0),
+                        dml::color(fr).unwrap_or(deckcraft_model::ColorRef::scheme(deckcraft_color::SchemeSlot::Accent1)),
+                    ));
+                }
+                def.background = Some(ps);
+            }
+            for el in st.elements() {
+                let Some(kind) = TablePart::from_xml(el.local()) else { continue };
+                let mut ps = TablePartStyle::default();
+                if let Some(tx) = el.child("tcTxStyle") {
+                    ps.text_color = dml::color(tx);
+                    ps.bold = tx.attr("b").map(|v| v == "on");
+                    ps.italic = tx.attr("i").map(|v| v == "on");
+                }
+                if let Some(tc) = el.child("tcStyle") {
+                    if let Some(f) = tc.child("fill").and_then(|f| f.elements().next()) {
+                        ps.fill = dml::fill_el(imp, part, f);
+                    }
+                    if let Some(fr) = tc.child("fillRef") {
+                        ps.fill_ref = Some((
+                            fr.u32("idx").unwrap_or(0),
+                            dml::color(fr).unwrap_or(deckcraft_model::ColorRef::scheme(deckcraft_color::SchemeSlot::Accent1)),
+                        ));
+                    }
+                    if let Some(bd) = tc.child("tcBdr") {
+                        for (i, side) in ["left", "right", "top", "bottom", "insideH", "insideV"].iter().enumerate() {
+                            let Some(b) = bd.child(side) else { continue };
+                            let border = if let Some(ln) = b.child("ln") {
+                                Some(TableBorder::Line { line: dml::line(imp, part, ln) })
+                            } else {
+                                b.child("lnRef").map(|r| TableBorder::Ref {
+                                    idx: r.u32("idx").unwrap_or(0),
+                                    color: dml::color(r).unwrap_or(deckcraft_model::ColorRef::scheme(deckcraft_color::SchemeSlot::Accent1)),
+                                })
+                            };
+                            if let Some(slot) = ps.borders.get_mut(i) {
+                                *slot = border;
+                            }
+                        }
+                    }
+                }
+                def.parts.push((kind, ps));
+            }
+            Some(def)
+        })
+        .collect()
 }
 
 fn background(imp: &mut Imp, part: &Part, csld: &El) -> Option<Background> {
@@ -523,10 +682,16 @@ fn read_layout(imp: &mut Imp, part: &Part, doc: &Doc) -> Layout {
             l.shapes = shapes::sp_tree(imp, part, &mut ctx, tree, 0);
         }
     }
+    l.color_map = color_map_override(root);
     if let Some(ext) = root.child("extLst").filter(|e| !has_rel_refs(e)) {
         l.raw_ext = Some(ext.elements().map(|e| part.keep(e)).collect());
     }
     l
+}
+
+/// A layout's or slide's `clrMapOvr/overrideClrMapping` (None for `masterClrMapping` or none).
+fn color_map_override(root: &El) -> Option<Vec<(String, String)>> {
+    root.child("clrMapOvr")?.child("overrideClrMapping").map(color_map)
 }
 
 fn read_slide(imp: &mut Imp, part: &Part, doc: &Doc, id: SlideId, layout: LayoutId) -> Slide {
@@ -536,6 +701,7 @@ fn read_slide(imp: &mut Imp, part: &Part, doc: &Doc, id: SlideId, layout: Layout
         layout,
         hidden: root.bool("show") == Some(false),
         show_master_shapes: root.bool("showMasterSp").unwrap_or(true),
+        color_map: color_map_override(root),
         ..Default::default()
     };
     let mut ctx = shapes::IdCtx::default();
@@ -544,6 +710,10 @@ fn read_slide(imp: &mut Imp, part: &Part, doc: &Doc, id: SlideId, layout: Layout
         s.background = background(imp, part, csld);
         if let Some(tree) = csld.child("spTree") {
             s.shapes = shapes::sp_tree(imp, part, &mut ctx, tree, 0);
+        }
+        if let Some(c) = csld.child("controls") {
+            let pics = shapes::controls(imp, part, &mut ctx, c);
+            s.shapes.extend(pics);
         }
     }
     if let Some(t) = root.child("transition") {

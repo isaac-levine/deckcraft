@@ -17,7 +17,38 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(noundo "text.exit", "Stop Editing Text", [], None, "{}", has_doc, exit),
         cmd!("text.insert", "Type Text", [], None, "{text} (\\n = new paragraph, \\u000b = line break)", has_text, insert),
         cmd!("text.delete", "Delete Text", [], Some("Backspace"), "{dir?: backward|forward|wordBackward|wordForward}", has_text, delete),
+        // The input method's composition: shown in place, an undo step only once committed.
+        CommandSpec {
+            id: "text.compose",
+            label: "Compose Text",
+            menu: &[],
+            shortcut: None,
+            params: "{text, active?: [start, end]} — an input method's composition (preedit) at the insertion point; empty text cancels it",
+            enabled: has_text,
+            run: compose,
+            journal: false,
+            undoable: false,
+        },
+        cmd!(
+            noundo "text.commit",
+            "Commit Composition",
+            [],
+            None,
+            "{text} — the input method's result replaces its composition, as one undo step",
+            has_text,
+            commit
+        ),
         cmd!(noundo "text.move", "Move Insertion Point", [], None, "{to: left|right|up|down|wordLeft|wordRight|lineStart|lineEnd|paraStart|paraEnd|start|end, extend?: bool}", has_text, move_caret),
+        cmd!(
+            "text.delete",
+            "Delete Text",
+            [],
+            Some("Backspace"),
+            "{dir?: backward|forward|wordBackward|wordForward} — the word directions are Ctrl+Backspace/Delete: they work from the start of a selection without deleting it",
+            has_text,
+            delete
+        ),
+        cmd!(noundo "text.move", "Move Insertion Point", [], None, "{to: left|right|up|down|wordLeft|wordRight|lineStart|lineEnd|paraStart|paraEnd|paraUp|paraDown|start|end, extend?: bool} — left/right are on screen: in a right-to-left paragraph left goes forward", has_text, move_caret),
         cmd!(noundo "text.select", "Select Text", [], None, "{anchor: [p, c], caret: [p, c]}", has_text, select),
         cmd!(noundo "text.selectAll", "Select All Text", [], None, "{}", has_text, select_all),
         cmd!(noundo "text.selectWord", "Select Word", [], None, "{at?: [p, c]}", has_text, select_word),
@@ -144,6 +175,35 @@ pub fn layout_for(st: &DocState, t: &TextSel) -> Option<deckcraft_text::TextLayo
     ))
 }
 
+/// The insertion point on the slide: its line from top to bottom, in slide coordinates (flips and
+/// vertical text as drawn). Text with no paragraph yet (a placeholder about to be typed in) is
+/// measured as one empty paragraph, so the caret shows where typing begins. `None` for notes and
+/// table cells, which aren't laid out on the slide here.
+pub fn caret_line(st: &DocState, t: &TextSel) -> Option<(deckcraft_geom::Point, deckcraft_geom::Point)> {
+    if t.notes || t.cell.is_some() {
+        return None;
+    }
+    let sh = st.shape(t.shape)?;
+    let ctx = ctx_for(&st.doc, &st.selection)?;
+    let x = xfrm_of(&st.doc, &st.selection, sh);
+    let geo = deckcraft_render::shape_geometry(sh, x.w, x.h);
+    let mut body = sh.text.clone().unwrap_or_default();
+    if body.paragraphs.is_empty() {
+        body.paragraphs.push(deckcraft_model::text::Paragraph::default());
+    }
+    let l = deckcraft_text::layout(
+        &ctx,
+        sh,
+        &body,
+        &deckcraft_text::Opts { rect: geo.text_rect, fields: &deckcraft_text::NoFields, prompt_color: None, no_shrink: false },
+    );
+    // After End on a wrapped line the caret is drawn at that line's end.
+    let aff = if t.at_line_end() { deckcraft_text::Affinity::Upstream } else { deckcraft_text::Affinity::Downstream };
+    let (cx, top, bot) = l.caret_drawn(deckcraft_text::Pos { para: t.caret.0, ch: t.caret.1 }, aff)?;
+    let m = deckcraft_render::text_transform(x.affine(), geo.text_rect, l.rotation);
+    Some((m * deckcraft_geom::Point::new(cx, top), m * deckcraft_geom::Point::new(cx, bot)))
+}
+
 fn pos_param(p: &Value, key: &str) -> Option<Pos> {
     let a = p.get(key)?.as_array()?;
     Some((a.first()?.as_u64()? as usize, a.get(1)?.as_u64()? as usize))
@@ -184,7 +244,7 @@ fn edit(s: &mut Session, p: &Value) -> Result<Value> {
     }
     s.select(|_, sel| {
         sel.shapes = vec![id];
-        sel.text = Some(TextSel { shape: id, anchor: at, caret: at, cell, notes: false });
+        sel.text = Some(TextSel { shape: id, anchor: at, caret: at, cell, notes: false, line_end: None });
     })?;
     Ok(json!({"id": id, "at": [at.0, at.1]}))
 }
@@ -340,6 +400,112 @@ pub(crate) fn insert_field(s: &mut Session, field: &str, text: &str) -> Result<V
     ok()
 }
 
+/// Text an input method sends: no paragraph or line breaks (Enter is a key of its own).
+fn ime_text(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Is the composition still where it was put (the paragraph holds all of it)?
+fn composition_fits(st: &DocState, c: &crate::Composition) -> bool {
+    let Some(t) = &st.selection.text else { return false };
+    let Some(body) = body_of(st, t) else { return false };
+    body.paragraphs.get(c.start.0).is_some_and(|p| c.start.1.saturating_add(c.len) <= p.char_len())
+}
+
+/// `text.compose`: put an input method's preedit at the insertion point (replacing the selection)
+/// or replace the composition with the new preedit. An empty preedit cancels: the presentation
+/// goes back to how it was before the composition began.
+fn compose(s: &mut Session, p: &Value) -> Result<Value> {
+    let text = ime_text(str_param(p, "text").ok_or_else(|| bad("text.compose", "missing `text`"))?);
+    let n = text.chars().count();
+    let active = p.get("active").and_then(Value::as_array).and_then(|a| {
+        let (x, y) = (a.first()?.as_u64()? as usize, a.get(1)?.as_u64()? as usize);
+        (x < y).then_some((x.min(n), y.min(n)))
+    });
+    let current = s.doc()?.composition.clone();
+    // A composition whose text was changed under it is kept as it is; a new one starts.
+    let current = match current {
+        Some(c) if !composition_fits(s.doc()?, &c) => {
+            s.end_composition();
+            None
+        }
+        c => c,
+    };
+    match current {
+        None if text.is_empty() => Ok(json!({"composing": false})),
+        None => {
+            let st = s.doc()?;
+            let (before, before_selection) = (st.doc.clone(), st.selection.clone());
+            let (start, props) = edit_text(s, |body, t| {
+                let (a, b) = t.ordered();
+                let at = ed::delete(body, a, b);
+                let props = if a != b { Some(ed::props_at(body, at)) } else { unlinked_at_link_end(body, at) };
+                let c = ed::insert(body, at, &text, props.clone());
+                t.anchor = c;
+                t.caret = c;
+                (at, props)
+            })?;
+            s.doc_mut()?.composition = Some(crate::Composition { start, len: n, active, props, before, before_selection });
+            Ok(json!({"composing": true, "start": [start.0, start.1], "len": n}))
+        }
+        Some(c) if text.is_empty() => {
+            let st = s.doc_mut()?;
+            st.doc = c.before;
+            st.selection = c.before_selection;
+            st.composition = None;
+            st.revision += 1;
+            Ok(json!({"composing": false}))
+        }
+        Some(c) => {
+            let (start, len, props) = (c.start, c.len, c.props.clone());
+            edit_text(s, |body, t| {
+                ed::delete(body, start, (start.0, start.1 + len));
+                let e = ed::insert(body, start, &text, props);
+                t.anchor = e;
+                t.caret = e;
+            })?;
+            s.doc_mut()?.composition = Some(crate::Composition { len: n, active, ..c });
+            Ok(json!({"composing": true, "start": [start.0, start.1], "len": n}))
+        }
+    }
+}
+
+/// `text.commit`: the input method's result replaces the composition (or is typed at the
+/// insertion point when there is none) and the whole composition becomes one undo step.
+fn commit(s: &mut Session, p: &Value) -> Result<Value> {
+    let text = ime_text(str_param(p, "text").ok_or_else(|| bad("text.commit", "missing `text`"))?);
+    if s.doc()?.composition.is_some() || !text.is_empty() {
+        compose(s, &json!({"text": text}))?;
+    }
+    s.end_composition();
+    let caret = s.doc()?.selection.text.as_ref().map(|t| t.caret).unwrap_or_default();
+    Ok(json!({"caret": [caret.0, caret.1]}))
+}
+
+/// Underlines under an input method's composition (#101), in slide coordinates: `(from, to,
+/// thick)` per line, thick under the part being converted. Empty without a composition or when
+/// the edited text isn't laid out on the slide (notes, table cells).
+pub fn composition_underlines(st: &DocState) -> Vec<(deckcraft_geom::Point, deckcraft_geom::Point, bool)> {
+    let (Some(c), Some(t)) = (&st.composition, &st.selection.text) else { return vec![] };
+    let Some(sh) = st.shape(t.shape) else { return vec![] };
+    let Some(l) = layout_for(st, t) else { return vec![] };
+    let x = xfrm_of(&st.doc, &st.selection, sh);
+    let tr = deckcraft_render::shape_geometry(sh, x.w, x.h).text_rect;
+    let m = deckcraft_render::text_transform(x.affine(), tr, l.rotation);
+    let pos = |ch: usize| deckcraft_text::Pos { para: c.start.0, ch: c.start.1 + ch };
+    let mut out = vec![];
+    let mut add = |a: usize, b: usize, thick: bool| {
+        for (x0, x1, y) in l.composition_underlines(pos(a), pos(b)) {
+            out.push((m * deckcraft_geom::Point::new(x0, y), m * deckcraft_geom::Point::new(x1, y), thick));
+        }
+    };
+    add(0, c.len, false);
+    if let Some((a, b)) = c.active {
+        add(a, b.min(c.len), true);
+    }
+    out
+}
+
 fn insert(s: &mut Session, p: &Value) -> Result<Value> {
     let text = str_param(p, "text").ok_or_else(|| bad("text.insert", "missing `text`"))?.to_string();
     insert_text(s, &text, None)
@@ -349,13 +515,15 @@ pub(crate) fn delete_dir(s: &mut Session, dir: &str) -> Result<Value> {
     let dir = dir.to_string();
     edit_text(s, move |body, t| {
         let (a, b) = t.ordered();
-        let at = if a != b {
+        let at = if dir == "wordBackward" || dir == "wordForward" {
+            // Ctrl+Backspace/Delete work from the start of a selection and leave the rest of it
+            // (PowerPoint for Windows).
+            ed::delete_word(body, a, dir == "wordForward")
+        } else if a != b {
             ed::delete(body, a, b)
         } else {
             let other = match dir.as_str() {
                 "forward" => ed::char_move(body, a, true),
-                "wordBackward" => ed::word_move(body, a, false),
-                "wordForward" => ed::word_move(body, a, true),
                 _ => {
                     // Backspace at the start of an indented/bulleted paragraph outdents first.
                     if a.1 == 0
@@ -382,7 +550,16 @@ fn delete(s: &mut Session, p: &Value) -> Result<Value> {
     delete_dir(s, str_param(p, "dir").unwrap_or("backward"))
 }
 
+/// Is paragraph `para` right-to-left (its lines run from the right)?
+fn para_rtl(layout: Option<&deckcraft_text::TextLayout>, body: &TextBody, para: usize) -> bool {
+    match layout.and_then(|l| l.lines.iter().find(|x| x.para == para)) {
+        Some(line) => line.rtl,
+        None => body.paragraphs.get(para).and_then(|x| x.props.rtl).unwrap_or(false),
+    }
+}
+
 fn move_caret(s: &mut Session, p: &Value) -> Result<Value> {
+    use deckcraft_text::Affinity;
     let to = str_param(p, "to").unwrap_or("right").to_string();
     let extend = bool_or(p, "extend", false);
     let st = s.doc()?;
@@ -391,27 +568,44 @@ fn move_caret(s: &mut Session, p: &Value) -> Result<Value> {
     let layout = layout_for(st, &t);
     let lp = |c: Pos| deckcraft_text::Pos { para: c.0, ch: c.1 };
     let caret = t.caret;
+    let aff = if t.at_line_end() { Affinity::Upstream } else { Affinity::Downstream };
+    // Left and right are on screen: in a right-to-left paragraph left goes forward in the text.
+    let rtl = para_rtl(layout.as_ref(), &body, caret.0);
+    let to = match (to.as_str(), rtl) {
+        ("left", true) => "right",
+        ("right", true) => "left",
+        ("wordLeft", true) => "wordRight",
+        ("wordRight", true) => "wordLeft",
+        (x, _) => x,
+    }
+    .to_string();
     let collapse_to = |left: bool| if left { t.ordered().0 } else { t.ordered().1 };
+    let mut upstream = false;
     let new = match to.as_str() {
         "left" if t.is_range() && !extend => collapse_to(true),
         "right" if t.is_range() && !extend => collapse_to(false),
         "left" => ed::char_move(&body, caret, false),
         "right" => ed::char_move(&body, caret, true),
-        "wordLeft" => ed::word_move(&body, caret, false),
-        "wordRight" => ed::word_move(&body, caret, true),
+        // Ctrl+arrows with a selection go on from its start (left) or end (right).
+        "wordLeft" => ed::word_move(&body, if extend { caret } else { collapse_to(true) }, false),
+        "wordRight" => ed::word_move(&body, if extend { caret } else { collapse_to(false) }, true),
         "paraStart" => (caret.0, 0),
         "paraEnd" => (caret.0, body.paragraphs.get(caret.0).map(|x| x.char_len()).unwrap_or(0)),
+        "paraUp" => ed::para_up(&body, caret),
+        "paraDown" => ed::para_down(&body, caret),
         "start" => (0, 0),
         "end" => ed::end(&body),
         "up" | "down" | "lineStart" | "lineEnd" => match &layout {
             Some(l) => {
-                let x = l.caret(lp(caret)).map(|c| c.0).unwrap_or(0.0);
-                let r = match to.as_str() {
-                    "up" => l.vertical(lp(caret), false, x),
-                    "down" => l.vertical(lp(caret), true, x),
-                    "lineStart" => l.line_bounds(lp(caret)).0,
-                    _ => l.line_bounds(lp(caret)).1,
+                let x = l.caret_drawn(lp(caret), aff).map(|c| c.0).unwrap_or(0.0);
+                let (r, a) = match to.as_str() {
+                    "up" => l.vertical_affine(lp(caret), aff, false, x),
+                    "down" => l.vertical_affine(lp(caret), aff, true, x),
+                    "lineStart" => (l.line_bounds_affine(lp(caret), aff).0, Affinity::Downstream),
+                    // End stays on its line: after a soft wrap the caret sits at the line's end.
+                    _ => l.line_end_caret(lp(caret), aff),
                 };
+                upstream = a == Affinity::Upstream;
                 (r.para, r.ch)
             }
             None => match to.as_str() {
@@ -427,12 +621,13 @@ fn move_caret(s: &mut Session, p: &Value) -> Result<Value> {
     s.select(|_, sel| {
         if let Some(tt) = sel.text.as_mut() {
             tt.caret = new;
+            tt.line_end = if upstream { Some(new) } else { None };
             if !extend {
                 tt.anchor = new;
             }
         }
     })?;
-    Ok(json!({"caret": [new.0, new.1]}))
+    Ok(json!({"caret": [new.0, new.1], "lineEnd": upstream}))
 }
 
 fn select(s: &mut Session, p: &Value) -> Result<Value> {
@@ -479,11 +674,14 @@ fn select_para(s: &mut Session, p: &Value) -> Result<Value> {
     let st = s.doc()?;
     let t = st.selection.text.clone().ok_or_else(|| bad("text.selectParagraph", "not editing text"))?;
     let at = pos_param(p, "at").unwrap_or(t.caret);
-    let n = body_of(st, &t).and_then(|b| b.paragraphs.get(at.0)).map(|x| x.char_len()).unwrap_or(0);
+    let body = body_of(st, &t);
+    let n = body.and_then(|b| b.paragraphs.get(at.0)).map(|x| x.char_len()).unwrap_or(0);
+    // The paragraph mark is part of the paragraph (PowerPoint's triple-click selects it too).
+    let end = if body.is_some_and(|b| at.0 + 1 < b.paragraphs.len()) { (at.0 + 1, 0) } else { (at.0, n) };
     s.select(|_, sel| {
         if let Some(t) = sel.text.as_mut() {
             t.anchor = (at.0, 0);
-            t.caret = (at.0, n);
+            t.caret = end;
         }
     })?;
     ok()

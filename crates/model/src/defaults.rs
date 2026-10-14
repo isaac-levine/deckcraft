@@ -243,6 +243,7 @@ pub fn build_master(size: Size, theme: Theme, first_id: u32) -> (Master, u32) {
             background: None,
             show_master_shapes: true,
             preserve: true,
+            color_map: None,
             raw_ext: None,
         });
     };
@@ -511,6 +512,7 @@ pub fn blank_presentation(size: Size, theme: Theme, title_slide: bool) -> Presen
         first_slide_number: 1,
         next_id: next.max(256),
         embedded_fonts: vec![],
+        table_styles: vec![],
         raw_ext: None,
     };
     if title_slide {

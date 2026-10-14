@@ -29,6 +29,25 @@ pub fn ui_shortcut(app: &mut SlideApp, key: egui::Key, m: Mods) -> bool {
             return true;
         }
         (S, true, true, false) => "app.saveAsDialog",
+        // File tab: Alt+F opens it on Home with the keyboard in its side menu; Ctrl+P on Print.
+        (F, false, false, true) => {
+            app.open_backstage(crate::backstage::Page::Home);
+            if let Some(b) = app.backstage.as_mut() {
+                b.focus = Some(0);
+            }
+            return true;
+        }
+        (P, true, false, false) => {
+            if app.session.active().is_none() {
+                return false;
+            }
+            app.open_backstage(crate::backstage::Page::Print);
+            return true;
+        }
+        (W, true, false, false) => {
+            app.close_presentation();
+            return true;
+        }
         (O, true, false, false) => "app.openDialog",
         (P, true, true, false) => "app.palette",
         (Comma, true, false, false) => "app.preferences",
@@ -133,10 +152,11 @@ pub fn menu_tree() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("New Presentation", "file.new"),
                 ("Open…", "app.openDialog"),
                 ("-", ""),
-                ("Close", "file.close"),
+                ("Close", "app.closePresentation"),
                 ("Save", "file.save"),
                 ("Save As…", "app.saveAsDialog"),
                 ("Export…", "app.exportDialog"),
+                ("Print…", "app.print"),
                 ("-", ""),
                 ("Properties", "file.properties"),
             ],

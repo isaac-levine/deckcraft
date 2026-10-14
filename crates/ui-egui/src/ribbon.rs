@@ -47,7 +47,7 @@ pub fn title_bar(app: &mut SlideApp, ui: &mut Ui) {
         child.spacing_mut().item_spacing.x = 2.0;
         let has_doc = app.session.active().is_some();
         let dirty = app.session.active().is_some_and(|d| d.is_dirty());
-        if icon_toggle(&mut child, Icon::Home, "Home", true, app.home_open()).clicked() {
+        if icon_toggle(&mut child, Icon::Home, "Home", true, app.backstage_open()).clicked() {
             let _ = app.run("app.home", json!({}));
         }
         if icon_toggle(&mut child, Icon::Save, "Save (⌘S)", has_doc, false).clicked() {
@@ -143,9 +143,24 @@ pub fn show(app: &mut SlideApp, ui: &mut Ui) {
     let h = 28.0 + if app.ui.ribbon_collapsed { 4.0 } else { RIBBON_H + 20.0 };
     egui::Panel::top("ribbon").exact_size(h).frame(egui::Frame::NONE.fill(t.chrome)).show(ui, |ui| {
         let rect = ui.max_rect();
-        // Tabs.
+        // Tabs. File comes first and opens the File tab's full-window view (Backstage), as in
+        // PowerPoint.
         let mut x = rect.min.x + 12.0;
         let y = rect.min.y + 2.0;
+        {
+            let w = ui.fonts_mut(|f| f.layout_no_wrap("File".to_string(), theme::font(13.0), t.text).size().x) + 18.0;
+            let r = Rect::from_min_size(pos2(x, y), vec2(w, 24.0));
+            let resp = ui.interact(r, ui.id().with("tab_file"), Sense::click());
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "File"));
+            if resp.hovered() {
+                ui.painter().rect_filled(r.shrink2(vec2(2.0, 2.0)), CornerRadius::same(4), t.hover);
+            }
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, "File", theme::font(13.0), t.text);
+            if resp.on_hover_text("File (Alt+F)").clicked() {
+                app.open_backstage(crate::backstage::Page::Home);
+            }
+            x += w + 2.0;
+        }
         let all: Vec<(&str, bool)> = TABS.iter().map(|s| (*s, false)).chain(ctx_tabs.iter().map(|s| (*s, true))).collect();
         for (name, contextual) in all {
             let font = theme::font(13.0);
@@ -1367,7 +1382,7 @@ fn transitions(app: &mut SlideApp, ui: &mut Ui) {
         let r = big_button(ui, Icon::EffectOptions, "Effect\nOptions", !opts.is_empty());
         egui::Popup::menu(&r).show(|ui| {
             for o in opts {
-                if ui.button(option_label(o)).clicked() {
+                if ui.button(deckcraft_model::anim::transition_option_label(&kind, o)).clicked() {
                     run(app, "transition.options", json!({"option": o}));
                 }
             }

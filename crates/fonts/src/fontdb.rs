@@ -52,6 +52,53 @@ pub fn substitutes(family: &str) -> &'static [&'static str] {
     }
 }
 
+/// Families whose open substitutes ([`substitutes`]) keep their metrics, so text drawn with
+/// them breaks into the same lines.
+fn has_metric_twin(family: &str) -> bool {
+    matches!(
+        family.to_ascii_lowercase().as_str(),
+        "calibri" | "calibri light" | "cambria" | "cambria math" | "arial" | "helvetica" | "times new roman" | "times" | "courier new" | "courier"
+    )
+}
+
+/// The installed family PowerPoint draws a missing `family` with instead of Calibri: Liberation
+/// Sans and Serif as Arial and Times New Roman (observed in PowerPoint; Liberation Mono, Carlito,
+/// Caladea, Arimo and Tinos are not mapped and draw in Calibri), and Windows' standard font
+/// substitutes (Arial CE, Times New Roman CYR…).
+fn office_twin(family: &str) -> Option<&'static str> {
+    let f = family.to_ascii_lowercase();
+    Some(match f.as_str() {
+        "liberation sans" | "helvetica" | "helv" => "Arial",
+        "liberation serif" | "times" | "tms rmn" => "Times New Roman",
+        _ => {
+            let base = f
+                .strip_suffix(" baltic")
+                .or(f.strip_suffix(" ce"))
+                .or(f.strip_suffix(" cyr"))
+                .or(f.strip_suffix(" greek"))
+                .or(f.strip_suffix(" tur"))?;
+            match base {
+                "arial" => "Arial",
+                "courier new" => "Courier New",
+                "times new roman" => "Times New Roman",
+                _ => return None,
+            }
+        }
+    })
+}
+
+/// Office's downloadable (cloud) families: PowerPoint fetches them when a document uses them, so
+/// they draw as themselves there, not as Calibri. Without them DeckCraft keeps their closest open
+/// substitute ([`substitutes`]; Aptos as Inter).
+fn is_office_cloud_font(family: &str) -> bool {
+    let f = family.to_ascii_lowercase();
+    f.starts_with("aptos") || ["bierstadt", "grandview", "seaford", "skeena", "tenorite"].iter().any(|c| f.starts_with(c))
+}
+
+/// The family PowerPoint draws a document's Latin text in when the font it names isn't installed,
+/// whatever the theme, `panose` or `pitchFamily` say.
+pub const MISSING_FONT_FAMILY: &str = "Calibri";
+
 #[derive(Clone)]
 enum FontBytes {
     Static(&'static [u8]),
@@ -65,6 +112,10 @@ pub struct FontFace {
     pub family: String,
     /// Typographic style name (e.g. "Semibold", "Italic").
     pub style: String,
+    /// The Windows (GDI) family and style names (`name` IDs 1 and 2) when the family differs from
+    /// the typographic one: "Segoe UI Semibold" / "Regular" for Segoe UI Semibold. Documents name
+    /// fonts this way.
+    pub legacy: Option<(String, String)>,
     /// usWeightClass-style weight (400 = regular).
     pub weight: f32,
     pub italic: bool,
@@ -79,6 +130,16 @@ pub struct FontFace {
     /// values).
     pub cap_height: f64,
     pub x_height: f64,
+    /// Where the baseline sits in a line, as a share of the line's height from its top: the
+    /// Windows ascent over the Windows ascent plus descent (OS/2 `usWinAscent`/`usWinDescent`),
+    /// the split PowerPoint uses (computed by `line_split`).
+    pub line_split: f64,
+    /// Underline position (top edge, below the baseline) and thickness in font units (`post`
+    /// table; 0.1 and 0.05 em when the font has none). PowerPoint draws single underlines there.
+    pub underline: (f64, f64),
+    /// Strikethrough position (top edge, above the baseline) and thickness in font units (OS/2;
+    /// 0.26 and 0.05 em when the font has none). PowerPoint draws single strikethroughs there.
+    pub strikeout: (f64, f64),
     pub shaper: harfrust::ShaperData,
     /// Variable fonts: the named instance's axis settings (user units; empty = default instance),
     /// the normalised location and the shaper's view of it.
@@ -87,6 +148,8 @@ pub struct FontFace {
     pub instance: Option<harfrust::ShaperInstance>,
     /// Basic Multilingual Plane coverage bitset, built on first use.
     bmp: std::sync::OnceLock<Box<[u64]>>,
+    /// Colour glyph tables present (`is_color`), looked up on first use.
+    color: std::sync::OnceLock<bool>,
 }
 
 /// A cheap `Copy` handle to a face. Faces are never unloaded, so the handle lives for the rest of
@@ -153,6 +216,11 @@ impl FontFace {
     }
     pub fn skrifa(&self) -> Option<skrifa::FontRef<'_>> {
         skrifa::FontRef::from_index(self.data(), self.index).ok()
+    }
+    /// Does the face draw colour glyphs (a `COLR`, `CBDT`, `sbix` or `SVG ` table, as colour emoji
+    /// fonts have)?
+    pub fn is_color(&self) -> bool {
+        *self.color.get_or_init(|| has_color_tables(self.data(), self.index))
     }
     pub fn hb(&self) -> Option<harfrust::FontRef<'_>> {
         harfrust::FontRef::from_index(self.data(), self.index).ok()
@@ -242,6 +310,11 @@ pub struct FontDb {
     /// scan, so what they find doesn't depend on what ran before them.
     #[cfg(not(target_arch = "wasm32"))]
     cataloged: std::sync::OnceLock<()>,
+    /// Families (lower case) whose cataloged files have all been loaded: a family's files load
+    /// together, so a lookup never settles for the one face another name loaded ("Segoe UI
+    /// Semibold" loads a face of the family "Segoe UI").
+    #[cfg(not(target_arch = "wasm32"))]
+    loaded_families: Mutex<std::collections::HashSet<String>>,
     /// System fallback state: enabled, and characters no system font covers.
     #[cfg(not(target_arch = "wasm32"))]
     sys: Mutex<SysFallback>,
@@ -252,6 +325,13 @@ pub struct FontDb {
 struct SysFallback {
     enabled: bool,
     misses: std::collections::HashSet<char>,
+}
+
+/// Does face `index` of `data` carry colour glyph tables?
+fn has_color_tables(data: &[u8], index: u32) -> bool {
+    use skrifa::raw::types::Tag;
+    let Ok(f) = skrifa::FontRef::from_index(data, index) else { return false };
+    [b"COLR", b"CBDT", b"sbix", b"SVG "].iter().any(|t| f.table_data(Tag::new(t)).is_some())
 }
 
 /// Families tried (when installed) for characters the loaded fonts lack: CJK, symbols, emoji.
@@ -296,6 +376,16 @@ fn face_names(f: &skrifa::FontRef<'_>) -> Option<(String, String)> {
     let family = name(f, &[StringId::TYPOGRAPHIC_FAMILY_NAME, StringId::FAMILY_NAME])?;
     let style = name(f, &[StringId::TYPOGRAPHIC_SUBFAMILY_NAME, StringId::SUBFAMILY_NAME]).unwrap_or_else(|| "Regular".into());
     Some((family, style))
+}
+
+/// A face's Windows (GDI) family and style (`name` IDs 1 and 2) when that family differs from the
+/// typographic `family`.
+fn legacy_names(f: &skrifa::FontRef<'_>, family: &str) -> Option<(String, String)> {
+    let legacy = name(f, &[StringId::FAMILY_NAME])?;
+    if legacy.eq_ignore_ascii_case(family) {
+        return None;
+    }
+    Some((legacy, name(f, &[StringId::SUBFAMILY_NAME]).unwrap_or_else(|| "Regular".into())))
 }
 
 /// (family, style) of every face in the font file at `path`, reading only its table directories
@@ -344,8 +434,13 @@ fn file_face_names(path: &std::path::Path) -> Vec<(String, String)> {
                 font.extend_from_slice(&u32::to_be_bytes(v));
             }
             font.extend_from_slice(&table);
-            face_names(&skrifa::FontRef::new(&font).ok()?)
+            let f = skrifa::FontRef::new(&font).ok()?;
+            let (family, style) = face_names(&f)?;
+            // Cataloged under its Windows family too, so "Segoe UI Semibold" finds the file.
+            let legacy = legacy_names(&f, &family);
+            Some(std::iter::once((family, style)).chain(legacy))
         })
+        .flatten()
         .collect()
 }
 
@@ -361,6 +456,12 @@ pub fn system_font_dirs() -> Vec<std::path::PathBuf> {
         dirs.extend(["/System/Library/Fonts", "/Library/Fonts"].map(Into::into));
         if let Some(h) = &home {
             dirs.push(h.join("Library/Fonts"));
+            // Fonts Microsoft Office downloads on demand (Aptos…), used where Office put them.
+            dirs.push(h.join("Library/Group Containers/UBF8T346G9.Office/FontCache/4/CloudFonts"));
+        }
+        // Fonts Office installs inside its apps.
+        for app in ["Microsoft PowerPoint", "Microsoft Word", "Microsoft Excel"] {
+            dirs.push(std::path::PathBuf::from(format!("/Applications/{app}.app/Contents/Resources/DFonts")));
         }
         // Fonts macOS ships as assets (PingFang, Yu Mincho, …): com_apple_MobileAsset_Font<N>.
         for parent in ["/System/Library/AssetsV2", "/System/Library/AssetsV2/PreinstalledAssetsV2/InstallWithOs"] {
@@ -375,7 +476,11 @@ pub fn system_font_dirs() -> Vec<std::path::PathBuf> {
         let root = std::env::var_os("WINDIR").map(std::path::PathBuf::from).unwrap_or_else(|| "C:\\Windows".into());
         dirs.push(root.join("Fonts"));
         if let Some(l) = std::env::var_os("LOCALAPPDATA") {
-            dirs.push(std::path::PathBuf::from(l).join("Microsoft\\Windows\\Fonts"));
+            let l = std::path::PathBuf::from(l);
+            dirs.push(l.join("Microsoft\\Windows\\Fonts"));
+            // Fonts Microsoft Office downloads on demand (Aptos…), used where Office put them;
+            // DeckCraft never ships or needs them.
+            dirs.push(l.join("Microsoft\\FontCache\\4\\CloudFonts"));
         }
     } else {
         dirs.extend(["/usr/share/fonts", "/usr/local/share/fonts"].map(Into::into));
@@ -436,6 +541,23 @@ pub(crate) fn last_resort_face() -> Arc<FontFace> {
     .clone()
 }
 
+/// The share of a line above the baseline (`FontFace::line_split`): OS/2 `usWinAscent` over
+/// `usWinAscent + usWinDescent`, else the ascent over ascent plus descent. Fonts whose Windows
+/// extent is huge (Gabriola, Cambria Math: over 1.5 em) get 0.81, where PowerPoint puts their
+/// baseline (observed).
+fn line_split(f: &skrifa::FontRef, ascent: f64, descent: f64, upem: f64) -> f64 {
+    use skrifa::raw::TableProvider;
+    let (a, d) = match f.os2() {
+        Ok(os2) if os2.us_win_ascent() > 0 => (os2.us_win_ascent() as f64, os2.us_win_descent() as f64),
+        _ => (ascent, descent),
+    };
+    let total = a + d;
+    if !total.is_finite() || total <= 0.0 || a < 0.0 || d < 0.0 {
+        return 0.8;
+    }
+    if total > upem * 1.5 { 0.81 } else { (a / total).clamp(0.5, 1.0) }
+}
+
 fn make_face(bytes: FontBytes, index: u32, family: String, style: String, coords: Vec<([u8; 4], f32)>) -> Option<FontFace> {
     let data: &[u8] = match &bytes {
         FontBytes::Static(b) => b,
@@ -456,10 +578,12 @@ fn make_face(bytes: FontBytes, index: u32, family: String, style: String, coords
         .map(|v| v >= 0.5)
         .or(axis(b"slnt").map(|v| v.abs() > 0.1))
         .unwrap_or(!matches!(a.style, skrifa::attribute::Style::Normal) || style_italic(&style));
+    let legacy = if coords.is_empty() { legacy_names(&f, &family) } else { None };
     Some(FontFace {
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
         family,
         style,
+        legacy,
         weight,
         italic,
         upem: m.units_per_em.max(1) as f64,
@@ -467,6 +591,9 @@ fn make_face(bytes: FontBytes, index: u32, family: String, style: String, coords
         descent: -(m.descent as f64),
         cap_height: m.cap_height.map(|v| v as f64).filter(|v| *v > 0.0).unwrap_or(m.ascent as f64 * 0.72),
         x_height: m.x_height.map(|v| v as f64).filter(|v| *v > 0.0).unwrap_or(m.ascent as f64 * 0.5),
+        line_split: line_split(&f, m.ascent as f64, -(m.descent as f64), m.units_per_em.max(1) as f64),
+        underline: underline_metrics(m.underline, m.units_per_em.max(1) as f64),
+        strikeout: strikeout_metrics(m.strikeout, m.units_per_em.max(1) as f64),
         shaper,
         coords,
         location,
@@ -474,7 +601,32 @@ fn make_face(bytes: FontBytes, index: u32, family: String, style: String, coords
         bytes,
         index,
         bmp: std::sync::OnceLock::new(),
+        color: std::sync::OnceLock::new(),
     })
+}
+
+/// The underline's top edge below the baseline and its thickness, font units, from the `post`
+/// table (its position is the top edge: Arial's -217/2048 is where PowerPoint's underline starts,
+/// 10 px below the baseline at 96 pt); fonts without a usable one get 0.1 em and 0.05 em.
+fn underline_metrics(d: Option<skrifa::metrics::Decoration>, upem: f64) -> (f64, f64) {
+    match d {
+        Some(d) if d.thickness > 0.0 && (d.thickness as f64) < upem * 0.3 && (d.offset as f64).abs() < upem * 0.5 => {
+            (-(d.offset as f64), d.thickness as f64)
+        }
+        _ => (upem * 0.1, upem * 0.05),
+    }
+}
+
+/// The strikethrough's top edge above the baseline and its thickness, font units, from OS/2 (its
+/// position is the top edge: Arial's 530/2048 is where PowerPoint's strikethrough starts, 25 px
+/// above the baseline at 96 pt); fonts without a usable one get 0.26 em and 0.05 em.
+fn strikeout_metrics(d: Option<skrifa::metrics::Decoration>, upem: f64) -> (f64, f64) {
+    match d {
+        Some(d) if d.thickness > 0.0 && (d.thickness as f64) < upem * 0.3 && d.offset > 0.0 && (d.offset as f64) < upem => {
+            (d.offset as f64, d.thickness as f64)
+        }
+        _ => (upem * 0.26, upem * 0.05),
+    }
 }
 
 /// The named style part of a style with axis settings (`Bold {wght:650}` → `Bold`).
@@ -533,6 +685,8 @@ impl FontDb {
             font_dirs,
             #[cfg(not(target_arch = "wasm32"))]
             cataloged: std::sync::OnceLock::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            loaded_families: Mutex::new(std::collections::HashSet::new()),
             #[cfg(not(target_arch = "wasm32"))]
             sys: Mutex::new(SysFallback { enabled: true, ..Default::default() }),
         }
@@ -639,6 +793,8 @@ impl FontDb {
     /// Returns the number of faces cataloged.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load_system_fonts(&self) -> usize {
+        // Families load again from the new catalog when next looked up.
+        self.loaded_families.lock().unwrap_or_else(|e| e.into_inner()).clear();
         // The first scan, or a rescan once it is done (never both at once).
         let mut first = None;
         self.cataloged.get_or_init(|| first = Some(self.scan_font_dirs()));
@@ -719,17 +875,35 @@ impl FontDb {
             .unwrap_or_else(last_resort_face)
     }
 
+    /// The face a document's text in `family` is drawn with, as PowerPoint draws it: the family
+    /// when it is installed or bundled, or a metric-compatible stand-in (Carlito for Calibri,
+    /// Liberation Sans for Arial…), or the family PowerPoint maps it to (Liberation Sans as Arial,
+    /// see `office_twin`); any other missing family is drawn in Calibri (or Carlito).
+    /// DeckCraft's own default family keeps [`FontDb::face`]'s fallbacks.
+    pub fn document_face(&self, family: &str, style: &str) -> Arc<FontFace> {
+        if family.eq_ignore_ascii_case(FALLBACK_FAMILY) || has_metric_twin(family) || is_office_cloud_font(family) || self.has_family(family) {
+            return self.face(family, style);
+        }
+        if let Some(twin) = office_twin(family) {
+            return self.face(twin, style);
+        }
+        self.face(MISSING_FONT_FAMILY, style)
+    }
+
     fn try_family(&self, family: &str, style: &str) -> Option<Arc<FontFace>> {
-        if let Some(f) = self.find(family, style) {
-            return Some(f);
-        }
+        // Every installed file of the family first, so the best style is among the candidates. The
+        // lock is held while the files load, so another thread looking up the family waits for
+        // them rather than finding none and falling back to another family.
         #[cfg(not(target_arch = "wasm32"))]
-        if self.load_cataloged(family)
-            && let Some(f) = self.find(family, style)
         {
-            return Some(f);
+            let mut loaded = self.loaded_families.lock().unwrap_or_else(|e| e.into_inner());
+            let key = family.to_lowercase();
+            if !loaded.contains(&key) {
+                self.load_cataloged(family);
+                loaded.insert(key);
+            }
         }
-        None
+        self.find(family, style)
     }
 
     /// Is `family` available (loaded, or installed on the system)?
@@ -745,7 +919,9 @@ impl FontDb {
     }
 
     pub(crate) fn is_loaded(&self, family: &str) -> bool {
-        self.read_faces().iter().any(|f| f.family.eq_ignore_ascii_case(family))
+        self.read_faces()
+            .iter()
+            .any(|f| f.family.eq_ignore_ascii_case(family) || f.legacy.as_ref().is_some_and(|(lf, _)| lf.eq_ignore_ascii_case(family)))
     }
 
     /// A variable font's axes: (tag, name, min, default, max), empty for static fonts.
@@ -800,11 +976,27 @@ impl FontDb {
             return self.instance(family, style);
         }
         let faces = self.read_faces();
-        let cands: Vec<&Arc<FontFace>> = faces.iter().filter(|f| f.family.eq_ignore_ascii_case(family)).collect();
+        let mut cands: Vec<&Arc<FontFace>> = faces.iter().filter(|f| f.family.eq_ignore_ascii_case(family)).collect();
+        let ns = norm(style);
+        if cands.is_empty() {
+            // A Windows family name ("Segoe UI Semibold", "Arial Black"): its faces, matched by
+            // their Windows style ("Regular", "Bold"…).
+            cands = faces.iter().filter(|f| f.legacy.as_ref().is_some_and(|(lf, _)| lf.eq_ignore_ascii_case(family))).collect();
+            if let Some(f) = cands.iter().find(|f| f.legacy.as_ref().is_some_and(|(_, ls)| norm(ls) == ns)) {
+                return Some((*f).clone());
+            }
+            // Bold of a family that is itself a weight (Semibold, Light): the face, made bolder
+            // by the caller, as Windows does, rather than a face of another weight.
+            if let Some(f) = cands
+                .iter()
+                .find(|f| f.legacy.as_ref().is_some_and(|(_, ls)| norm(ls) == norm(if style_italic(style) { "Italic" } else { "Regular" })))
+            {
+                return Some((*f).clone());
+            }
+        }
         if cands.is_empty() {
             return None;
         }
-        let ns = norm(style);
         if let Some(f) = cands.iter().find(|f| norm(&f.style) == ns) {
             return Some((*f).clone());
         }
@@ -877,6 +1069,134 @@ impl FontDb {
             }
         }
         self.sys.lock().unwrap_or_else(|e| e.into_inner()).misses.insert(c);
+        false
+    }
+
+    /// A loaded colour face drawing all of `cluster`, loading an installed colour font that covers
+    /// `key` if none is loaded yet. Misses are remembered.
+    pub(crate) fn color_face_for(&self, key: char, cluster: &[char]) -> Option<Arc<FontFace>> {
+        let pick = |db: &FontDb| {
+            let faces = db.read_faces();
+            let mut v: Vec<&Arc<FontFace>> = faces.iter().filter(|f| crate::covers_cluster(f, cluster) && f.is_color()).collect();
+            v.sort_by_key(|f| (f.italic, (f.weight - 400.0).abs() as i32));
+            v.first().map(|f| (*f).clone())
+        };
+        if let Some(f) = pick(self) {
+            return Some(f);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.system_color_fallback(key) {
+            return pick(self);
+        }
+        let _ = key;
+        None
+    }
+
+    /// A loaded plain (not colour) face drawing all of `cluster`, loading an installed plain font
+    /// that covers `key` if none is loaded yet. Misses are remembered.
+    pub(crate) fn plain_face_for(&self, key: char, cluster: &[char]) -> Option<Arc<FontFace>> {
+        // Symbol fonts first (PowerPoint draws ⚠ ♥ ⬆ from the system's symbol font), then the
+        // usual fallback families in order, then any other.
+        let rank = |f: &FontFace| {
+            if f.family.contains("Symbol") {
+                return 0;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(i) = SYSTEM_FALLBACKS.iter().position(|s| s.eq_ignore_ascii_case(&f.family)) {
+                return i + 1;
+            }
+            1000
+        };
+        let pick = |db: &FontDb| {
+            let faces = db.read_faces();
+            let mut v: Vec<&Arc<FontFace>> = faces.iter().filter(|f| !f.is_color() && crate::covers_cluster(f, cluster)).collect();
+            v.sort_by_key(|f| (rank(f), f.italic, (f.weight - 400.0).abs() as i32));
+            v.first().map(|f| (*f).clone())
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let cataloged: Vec<String> = self.read_catalog().iter().map(|e| e.family.clone()).collect();
+            for fam in SYSTEM_FALLBACKS.iter().filter(|f| f.contains("Symbol")) {
+                if !self.is_loaded(fam) && cataloged.iter().any(|f| f.eq_ignore_ascii_case(fam)) {
+                    self.load_cataloged(fam);
+                }
+            }
+        }
+        if let Some(f) = pick(self) {
+            return Some(f);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.system_plain_fallback(key) {
+            return pick(self);
+        }
+        let _ = key;
+        None
+    }
+
+    /// Load an installed font without colour tables covering `c`. True if one was loaded.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn system_plain_fallback(&self, c: char) -> bool {
+        static MISSES: Mutex<Option<std::collections::HashSet<char>>> = Mutex::new(None);
+        if c.is_control() || c.is_whitespace() {
+            return false;
+        }
+        if !self.sys.lock().unwrap_or_else(|e| e.into_inner()).enabled {
+            return false;
+        }
+        if MISSES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).contains(&c) {
+            return false;
+        }
+        let mut paths: Vec<std::path::PathBuf> = self.read_catalog().iter().map(|e| e.path.clone()).collect();
+        paths.sort();
+        paths.dedup();
+        for p in paths {
+            if std::fs::metadata(&p).map(|m| m.len() > 40 << 20).unwrap_or(true) {
+                continue;
+            }
+            let Ok(data) = std::fs::read(&p) else { continue };
+            let hit = enumerate_faces(&data).iter().any(|(i, _, _, _)| {
+                !has_color_tables(&data, *i) && skrifa::FontRef::from_index(&data, *i).is_ok_and(|f| f.charmap().map(c).is_some())
+            });
+            if hit && self.add_font(data) > 0 {
+                return true;
+            }
+        }
+        MISSES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(c);
+        false
+    }
+
+    /// Load an installed colour font covering `c`. True if one was loaded.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn system_color_fallback(&self, c: char) -> bool {
+        static MISSES: Mutex<Option<std::collections::HashSet<char>>> = Mutex::new(None);
+        if c.is_control() || c.is_whitespace() {
+            return false;
+        }
+        {
+            let sys = self.sys.lock().unwrap_or_else(|e| e.into_inner());
+            if !sys.enabled {
+                return false;
+            }
+        }
+        if MISSES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).contains(&c) {
+            return false;
+        }
+        let mut paths: Vec<std::path::PathBuf> = self.read_catalog().iter().map(|e| e.path.clone()).collect();
+        paths.sort();
+        paths.dedup();
+        for p in paths {
+            if std::fs::metadata(&p).map(|m| m.len() > 64 << 20).unwrap_or(true) {
+                continue;
+            }
+            let Ok(data) = std::fs::read(&p) else { continue };
+            let hit = enumerate_faces(&data).iter().any(|(i, _, _, _)| {
+                has_color_tables(&data, *i) && skrifa::FontRef::from_index(&data, *i).is_ok_and(|f| f.charmap().map(c).is_some())
+            });
+            if hit && self.add_font(data) > 0 {
+                return true;
+            }
+        }
+        MISSES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(c);
         false
     }
 

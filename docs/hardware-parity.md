@@ -1,6 +1,6 @@
 # Hardware parity with PowerPoint
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** major (created from the renderer, media and windowing code) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365); PowerPoint for Windows where noted
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-12 · **Change:** minor (IME input, #101; previous: major, created from the renderer, media and windowing code) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365); PowerPoint for Windows where noted
 
 What hardware PowerPoint uses and what DeckCraft uses, per platform. Dimension score: **~40%
 ready** (estimated), **25–45 h** to parity. Performance (unmeasured, ~55%) is tracked here too
@@ -46,7 +46,7 @@ because it mostly follows from hardware use.
 | Pinch to zoom, two-finger gestures | yes | no |
 | Pen pressure and tilt for ink (Apple Pencil via Sidecar, Windows Ink) | yes | no: ink strokes have constant width |
 | Touch screens (Windows) | yes | basic pointer only |
-| IME input methods for CJK text | yes | no (see [localization-parity.md](localization-parity.md)) |
+| IME input methods for CJK text | yes | yes: composed in place, underlined, candidate window at the caret (#101) |
 | Dictation | yes (macOS) | no |
 
 ## Performance
@@ -71,4 +71,5 @@ outlines every frame (#67, fix open), and the decoders run in software.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-12 | minor | IME input methods (#101) |
 | 2026-10-10 | major | Created: rendering, media, displays, input and performance against PowerPoint 16.113 |

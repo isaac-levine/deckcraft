@@ -504,6 +504,30 @@ fn hyperlink_on_a_word_or_shape_links_it() {
     assert!(s.doc().unwrap().current_slide().unwrap().shapes[0].click.is_some(), "a selected shape gets the link as its click action");
 }
 
+/// A .pptx (base64) whose first slide's title is set in `font`.
+fn deck_in_font(font: &str) -> String {
+    let mut p = deckcraft_model::Presentation::default();
+    let slide = std::sync::Arc::make_mut(&mut p.slides[0]);
+    let mut body = deckcraft_model::text::TextBody::from_text("Hello");
+    body.paragraphs[0].runs[0].props.font = Some(font.into());
+    slide.shapes[0].text = Some(body);
+    crate::cmd::base64_encode(&crate::cmd::file::save_bytes(&p, "pptx").unwrap())
+}
+
+#[test]
+fn opening_a_file_lists_the_fonts_it_uses_that_are_missing() {
+    let mut s = Session::with_new();
+    let r = s.execute("file.openBytes", &json!({"name": "a.pptx", "data": deck_in_font("Qqq Nonexistent Sans")})).unwrap();
+    assert_eq!(r["missingFonts"], json!(["Qqq Nonexistent Sans"]));
+    assert_eq!(s.doc().unwrap().missing_fonts, vec!["Qqq Nonexistent Sans".to_string()]);
+    // A font that is there (bundled or installed) isn't listed; new documents list nothing.
+    let have = deckcraft_fonts::FontDb::global().face(deckcraft_fonts::FALLBACK_FAMILY, "Regular").family.clone();
+    let r = s.execute("file.openBytes", &json!({"name": "b.pptx", "data": deck_in_font(&have)})).unwrap();
+    assert_eq!(r["missingFonts"], json!([]));
+    s.execute("file.new", &json!({})).unwrap();
+    assert!(s.doc().unwrap().missing_fonts.is_empty());
+}
+
 #[test]
 fn clicks_in_flipped_shapes_hit_the_text_where_it_is_drawn() {
     // Flips don't mirror text, so a click lands on the character drawn under it.
@@ -542,4 +566,272 @@ fn inserted_hyperlinks_look_like_links() {
     // Underline off is the run's own u="none", as in PowerPoint.
     s.execute("format.underline", &json!({})).unwrap();
     assert_eq!(s.execute("format.state", &json!({})).unwrap()["underline"], false);
+}
+
+/// #270: shapes off the slide (in the editor's pasteboard) are hit, selected, moved and marqueed
+/// like any other; one can be dragged back onto the slide or out of it.
+#[test]
+fn shapes_off_the_slide_can_be_selected_and_moved() {
+    let mut s = session();
+    s.prefs.snap_to_grid = false;
+    s.prefs.smart_guides = false;
+    let off = s.execute("shape.insert", &json!({"preset": "rect", "rect": [1000.0, 100.0, 120.0, 80.0]})).unwrap()["id"].as_u64().unwrap();
+    let half = s.execute("shape.insert", &json!({"preset": "ellipse", "rect": [-60.0, 300.0, 120.0, 80.0]})).unwrap()["id"].as_u64().unwrap();
+    // Inserting off the slide keeps the box where it was asked for.
+    assert_eq!(s.execute("shape.inspect", &json!({"id": off})).unwrap()["box"]["x"], 1000.0);
+    s.execute("edit.select", &json!({"ids": []})).unwrap();
+    let ev = |kind, x, y| PointerEvent { kind, x, y, mods: Mods::default(), tol: 3.0 };
+    // Hover and click wholly off the slide.
+    assert!(matches!(s.hit_test(deckcraft_geom::Point::new(1060.0, 140.0), 3.0), Some(tools::Hit::Shape { id, .. }) if id.0 as u64 == off));
+    s.pointer(ev(PointerKind::Down, 1060.0, 140.0)).unwrap();
+    s.pointer(ev(PointerKind::Up, 1060.0, 140.0)).unwrap();
+    assert_eq!(s.doc().unwrap().selection.shapes.iter().map(|i| i.0 as u64).collect::<Vec<_>>(), vec![off]);
+    // Drag it further off, then back onto the slide.
+    s.pointer(ev(PointerKind::Down, 1060.0, 140.0)).unwrap();
+    s.pointer(ev(PointerKind::Drag, 1110.0, 160.0)).unwrap();
+    s.pointer(ev(PointerKind::Up, 1110.0, 160.0)).unwrap();
+    let v = s.execute("shape.inspect", &json!({"id": off})).unwrap();
+    assert_eq!((v["box"]["x"].as_f64(), v["box"]["y"].as_f64()), (Some(1050.0), Some(120.0)));
+    s.pointer(ev(PointerKind::Down, 1110.0, 160.0)).unwrap();
+    s.pointer(ev(PointerKind::Drag, 500.0, 160.0)).unwrap();
+    s.pointer(ev(PointerKind::Up, 500.0, 160.0)).unwrap();
+    assert_eq!(s.execute("shape.inspect", &json!({"id": off})).unwrap()["box"]["x"], 440.0);
+    // The off-slide half of a straddling shape is hit too.
+    s.pointer(ev(PointerKind::Down, -30.0, 340.0)).unwrap();
+    s.pointer(ev(PointerKind::Up, -30.0, 340.0)).unwrap();
+    assert_eq!(s.doc().unwrap().selection.shapes.iter().map(|i| i.0 as u64).collect::<Vec<_>>(), vec![half]);
+    // A marquee started on the pasteboard selects what it encloses there.
+    s.pointer(ev(PointerKind::Down, -100.0, 250.0)).unwrap();
+    s.pointer(ev(PointerKind::Drag, 80.0, 420.0)).unwrap();
+    s.pointer(ev(PointerKind::Up, 80.0, 420.0)).unwrap();
+    assert_eq!(s.doc().unwrap().selection.shapes.iter().map(|i| i.0 as u64).collect::<Vec<_>>(), vec![half]);
+}
+
+fn title_text(s: &Session) -> String {
+    let sh = &s.doc().unwrap().current_slide().unwrap().shapes[0];
+    sh.text.as_ref().map(|t| t.paragraphs.iter().map(|p| p.text()).collect::<Vec<_>>().join("\n")).unwrap_or_default()
+}
+
+/// #101: Korean typed through an input method arrives as preedit updates (ㅎ → 하 → 한 → 한ㄱ →
+/// 한그 → 한글) and a commit. The preedit is shown in place and replaced on each update; the
+/// committed text is one undo step, and nothing on the way is an undo step of its own.
+#[test]
+fn ime_composition_replaces_its_preedit_and_commits_as_one_undo_step() {
+    let mut s = session();
+    let title = s.doc().unwrap().current_slide().unwrap().shapes[0].id.0;
+    s.execute("text.edit", &json!({"id": title})).unwrap();
+    s.execute("text.insert", &json!({"text": "A "})).unwrap();
+    let undo0 = s.doc().unwrap().history.undo.len();
+    for pre in ["ㅎ", "하", "한", "한ㄱ", "한그", "한글"] {
+        s.compose_text(pre, None).unwrap();
+        assert_eq!(title_text(&s), format!("A {pre}"), "the preedit is shown in place");
+        let c = s.doc().unwrap().composition.clone().unwrap();
+        assert_eq!((c.start, c.len), ((0, 2), pre.chars().count()));
+        assert_eq!(s.doc().unwrap().selection.text.as_ref().unwrap().caret, (0, 2 + pre.chars().count()), "caret after the preedit");
+        assert_eq!(s.doc().unwrap().history.undo.len(), undo0, "no undo step while composing");
+    }
+    s.commit_text("한글").unwrap();
+    assert_eq!(title_text(&s), "A 한글");
+    assert!(s.doc().unwrap().composition.is_none());
+    assert_eq!(s.doc().unwrap().history.undo.len(), undo0 + 1, "one undo step for the composition");
+    assert_eq!(s.doc().unwrap().history.undo.last().unwrap().label, "Type Text");
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(title_text(&s), "A ");
+    s.execute("edit.redo", &json!({})).unwrap();
+    assert_eq!(title_text(&s), "A 한글");
+
+    // Windows' Korean IME commits a syllable when the next begins: an empty preedit, the commit,
+    // then a new preedit.
+    s.compose_text("ㄴ", None).unwrap();
+    s.compose_text("", None).unwrap();
+    s.commit_text("ㄴ").unwrap();
+    s.compose_text("ㅁ", None).unwrap();
+    assert_eq!(title_text(&s), "A 한글ㄴㅁ");
+    s.commit_text("마").unwrap();
+    assert_eq!(title_text(&s), "A 한글ㄴ마");
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(title_text(&s), "A 한글ㄴ");
+}
+
+/// #101: an empty preedit cancels the composition (Escape, or Backspace over its last jamo):
+/// the text and the selection it replaced are as they were, with no undo step.
+#[test]
+fn ime_cancel_restores_the_text_and_selection() {
+    let mut s = session();
+    let title = s.doc().unwrap().current_slide().unwrap().shapes[0].id.0;
+    s.execute("text.edit", &json!({"id": title})).unwrap();
+    s.execute("text.insert", &json!({"text": "Hello world"})).unwrap();
+    s.execute("text.select", &json!({"anchor": [0, 6], "caret": [0, 11]})).unwrap();
+    let undo0 = s.doc().unwrap().history.undo.len();
+    let rev = s.doc().unwrap().revision;
+    s.compose_text("せかい", Some((0, 3))).unwrap();
+    assert_eq!(title_text(&s), "Hello せかい", "the preedit replaces the selection");
+    assert_eq!(s.doc().unwrap().composition.as_ref().unwrap().active, Some((0, 3)));
+    s.compose_text("世界", Some((0, 9))).unwrap();
+    assert_eq!(s.doc().unwrap().composition.as_ref().unwrap().active, Some((0, 2)), "clamped to the preedit");
+    s.compose_text("", None).unwrap();
+    assert_eq!(title_text(&s), "Hello world");
+    let t = s.doc().unwrap().selection.text.clone().unwrap();
+    assert_eq!((t.anchor, t.caret), ((0, 6), (0, 11)), "the selection is back");
+    assert_eq!(s.doc().unwrap().history.undo.len(), undo0);
+    assert!(s.doc().unwrap().revision > rev, "redrawn");
+    // A commit of nothing without a composition is nothing.
+    s.commit_text("").unwrap();
+    assert_eq!(s.doc().unwrap().history.undo.len(), undo0);
+    // A commit without a preedit (some input methods send only the result) is one step.
+    s.commit_text("世界").unwrap();
+    assert_eq!(title_text(&s), "Hello 世界");
+    assert_eq!(s.doc().unwrap().history.undo.len(), undo0 + 1);
+}
+
+/// #101: anything else settles the composition first: its text stays and is its own undo step.
+#[test]
+fn ime_composition_is_kept_by_a_key_a_click_or_another_command() {
+    let mut s = session();
+    let title = s.doc().unwrap().current_slide().unwrap().shapes[0].id.0;
+    s.execute("text.edit", &json!({"id": title})).unwrap();
+    let undo0 = s.doc().unwrap().history.undo.len();
+    s.compose_text("안", None).unwrap();
+    s.key("Right", Mods::default()).unwrap();
+    assert!(s.doc().unwrap().composition.is_none());
+    assert_eq!(title_text(&s), "안");
+    assert_eq!(s.doc().unwrap().history.undo.len(), undo0 + 1);
+
+    s.compose_text("녕", None).unwrap();
+    s.pointer(PointerEvent { kind: PointerKind::Move, x: 5.0, y: 5.0, mods: Mods::default(), tol: 4.0 }).unwrap();
+    assert!(s.doc().unwrap().composition.is_some(), "hovering keeps composing");
+    s.pointer(PointerEvent { kind: PointerKind::Down, x: 5.0, y: 5.0, mods: Mods::default(), tol: 4.0 }).unwrap();
+    assert!(s.doc().unwrap().composition.is_none(), "a click settles it");
+    assert_eq!(title_text(&s), "안녕");
+
+    s.execute("text.edit", &json!({"id": title})).unwrap();
+    s.compose_text("하", None).unwrap();
+    s.execute("text.get", &json!({"id": title})).unwrap();
+    assert!(s.doc().unwrap().composition.is_some(), "a query doesn't");
+    s.execute("text.insert", &json!({"text": "!"})).unwrap();
+    assert_eq!(title_text(&s), "안녕하!");
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(title_text(&s), "안녕하");
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(title_text(&s), "안녕");
+
+    // Text changed under the composition (here behind its back): a new one starts, no panic.
+    s.compose_text("ㄱ", None).unwrap();
+    s.doc_mut().unwrap().composition.as_mut().unwrap().len = 99;
+    s.compose_text("가", None).unwrap();
+    assert!(title_text(&s).ends_with('가'));
+    // Control characters (an Enter sent as text) never split the paragraph.
+    s.commit_text("가\n\r\u{b}").unwrap();
+    assert_eq!(s.doc().unwrap().current_slide().unwrap().shapes[0].text.as_ref().unwrap().paragraphs.len(), 1);
+}
+
+/// #101: the first preedit on a selected shape starts editing it and replaces its text, as typing
+/// does; with nothing selected there is nowhere to compose.
+#[test]
+fn ime_on_a_selected_shape_replaces_its_text() {
+    let mut s = session();
+    let r = s.execute("shape.insert", &json!({"preset": "rect", "rect": [100, 100, 200, 100], "text": "Old"})).unwrap();
+    let id = r["id"].as_u64().unwrap();
+    s.select(|_, sel| {
+        sel.text = None;
+        sel.shapes = vec![ShapeId(id as u32)];
+    })
+    .unwrap();
+    assert_eq!(s.compose_text("", None).unwrap()["handled"], false, "an empty preedit doesn't start editing");
+    s.compose_text("新", None).unwrap();
+    s.commit_text("新しい").unwrap();
+    let v = s.execute("text.get", &json!({"id": id})).unwrap();
+    assert_eq!(v["text"], "新しい");
+    s.select(|_, sel| {
+        sel.text = None;
+        sel.shapes.clear();
+    })
+    .unwrap();
+    assert_eq!(s.compose_text("x", None).unwrap()["handled"], false);
+    assert_eq!(s.commit_text("x").unwrap()["handled"], false);
+}
+
+/// #101: the composition is underlined in place, under the composed characters, with a thicker
+/// line under the part being converted.
+#[test]
+fn ime_composition_underlines_follow_the_text() {
+    let mut s = session();
+    let title = s.doc().unwrap().current_slide().unwrap().shapes[0].id.0;
+    s.execute("text.edit", &json!({"id": title})).unwrap();
+    assert!(cmd::text::composition_underlines(s.doc().unwrap()).is_empty());
+    s.compose_text("にほんご", Some((2, 4))).unwrap();
+    let u = cmd::text::composition_underlines(s.doc().unwrap());
+    let thin: Vec<_> = u.iter().filter(|x| !x.2).collect();
+    let thick: Vec<_> = u.iter().filter(|x| x.2).collect();
+    assert_eq!((thin.len(), thick.len()), (1, 1), "{u:?}");
+    let sh = s.doc().unwrap().current_slide().unwrap().shapes[0].clone();
+    let x = cmd::xfrm_of(&s.doc().unwrap().doc, &s.doc().unwrap().selection, &sh);
+    for (a, b, _) in &u {
+        assert!(b.x > a.x && (a.y - b.y).abs() < 1e-9, "a horizontal line: {a:?} {b:?}");
+        assert!(a.x >= x.x - 1.0 && b.x <= x.x + x.w + 1.0 && a.y > x.y && a.y < x.y + x.h, "inside the title box");
+    }
+    assert!(thick[0].0.x > thin[0].0.x && (thick[0].1.x - thin[0].1.x).abs() < 1e-6, "the converted part is the end");
+    s.commit_text("日本語").unwrap();
+    assert!(cmd::text::composition_underlines(s.doc().unwrap()).is_empty());
+}
+
+/// File › Info (#76): the active presentation's name, location, counts and properties.
+#[test]
+fn file_info_reports_the_presentation() {
+    let mut s = session();
+    s.execute("slide.new", &json!({})).unwrap();
+    s.execute("slide.new", &json!({})).unwrap();
+    s.execute("slide.go", &json!({"index": 1})).unwrap();
+    s.execute("slide.hide", &json!({})).unwrap();
+    s.execute("file.properties", &json!({"title": "Quarterly", "author": "Ada"})).unwrap();
+    let v = s.execute("file.info", &json!({})).unwrap();
+    assert_eq!(v["slides"], 3);
+    assert_eq!(v["hiddenSlides"], 1);
+    assert_eq!(v["path"], serde_json::Value::Null);
+    assert_eq!(v["dirty"], true);
+    assert_eq!(v["properties"]["title"], "Quarterly");
+    assert_eq!(v["properties"]["author"], "Ada");
+    assert!(v["title"].as_str().is_some_and(|t| !t.is_empty()));
+    // A query: no undo step, and nothing changes.
+    let before = s.doc().unwrap().history.undo.len();
+    s.execute("file.info", &json!({})).unwrap();
+    assert_eq!(s.doc().unwrap().history.undo.len(), before);
+    // Saved to disk, it reports where and how big.
+    let dir = std::env::temp_dir().join(format!("deckcraft-info-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Info test.pptx").to_string_lossy().to_string();
+    s.execute("file.saveAs", &json!({"path": path})).unwrap();
+    let v = s.execute("file.info", &json!({})).unwrap();
+    assert_eq!(v["path"], path.as_str());
+    assert_eq!(v["format"], "pptx");
+    assert_eq!(v["dirty"], false);
+    assert!(v["bytes"].as_u64().is_some_and(|b| b > 0));
+    let _ = std::fs::remove_dir_all(&dir);
+    // Nothing open: an error, not a panic.
+    let mut empty = Session::new();
+    assert!(empty.execute("file.info", &json!({})).is_err());
+}
+
+/// The Print page's Slides box (#76): PowerPoint-style ranges, 1-based.
+#[test]
+fn slide_ranges_parse_like_powerpoints_print_box() {
+    use cmd::file::parse_slide_range as r;
+    assert_eq!(r("1-3, 5", 6).unwrap(), vec![0, 1, 2, 4]);
+    assert_eq!(r("3-1;2", 6).unwrap(), vec![0, 1, 2], "reversed ranges and repeats");
+    assert_eq!(r(" 6 ", 6).unwrap(), vec![5]);
+    assert!(r("7", 6).is_err(), "past the last slide");
+    assert!(r("0", 6).is_err());
+    assert!(r("a-b", 6).is_err());
+    assert!(r(" , ", 6).is_err());
+    assert!(r("1-99999999999999999999999", 6).is_err(), "hostile numbers are refused");
+    // file.export takes the same text for a PDF.
+    let mut s = session();
+    s.execute("slide.new", &json!({})).unwrap();
+    let doc = s.doc().unwrap().doc.clone();
+    let one = cmd::file::pdf_bytes(&doc, &json!({"slides": "2"})).unwrap();
+    let both = cmd::file::pdf_bytes(&doc, &json!({"slides": "1-2"})).unwrap();
+    assert!(one.len() < both.len());
+    assert!(cmd::file::pdf_bytes(&doc, &json!({"slides": "5"})).is_err());
+    let opts = cmd::file::pdf_options(&json!({"slides": [0, 7, 1]}), 2).unwrap();
+    assert_eq!(opts.slides, Some(vec![0, 1]), "indices past the end are dropped");
 }

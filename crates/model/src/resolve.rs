@@ -22,23 +22,27 @@ pub struct Ctx<'a> {
     pub layout: Option<&'a Layout>,
     pub owner: Owner,
     pub scheme: ColorScheme,
+    /// The colour map in force: the slide's override, else its layout's, else the master's.
+    pub color_map: Vec<(String, String)>,
 }
 
 impl<'a> Ctx<'a> {
     pub fn for_slide(pres: &'a Presentation, slide: &Slide) -> Option<Ctx<'a>> {
         let (master, layout) = pres.master_for(slide)?;
-        Some(Ctx { pres, master, layout, owner: Owner::Slide, scheme: master.scheme() })
+        let map = slide.color_map.as_ref().or(layout.and_then(|l| l.color_map.as_ref())).unwrap_or(&master.color_map).clone();
+        Some(Ctx { pres, master, layout, owner: Owner::Slide, scheme: master.scheme_with(&map), color_map: map })
     }
     pub fn for_layout(pres: &'a Presentation, master: &'a Master, layout: &'a Layout) -> Ctx<'a> {
-        Ctx { pres, master, layout: Some(layout), owner: Owner::Layout, scheme: master.scheme() }
+        let map = layout.color_map.as_ref().unwrap_or(&master.color_map).clone();
+        Ctx { pres, master, layout: Some(layout), owner: Owner::Layout, scheme: master.scheme_with(&map), color_map: map }
     }
     pub fn for_master(pres: &'a Presentation, master: &'a Master) -> Ctx<'a> {
-        Ctx { pres, master, layout: None, owner: Owner::Master, scheme: master.scheme() }
+        Ctx { pres, master, layout: None, owner: Owner::Master, scheme: master.scheme(), color_map: master.color_map.clone() }
     }
     pub fn color(&self, c: &ColorRef, ph: Option<Rgba>) -> Rgba {
         let c = match &c.base {
             crate::ColorBase::Scheme { slot } if matches!(slot, SchemeSlot::Bg1 | SchemeSlot::Tx1 | SchemeSlot::Bg2 | SchemeSlot::Tx2) => {
-                ColorRef { base: crate::ColorBase::Scheme { slot: self.master.map_slot(*slot) }, mods: c.mods.clone() }
+                ColorRef { base: crate::ColorBase::Scheme { slot: crate::map_slot(&self.color_map, *slot) }, mods: c.mods.clone() }
             }
             _ => c.clone(),
         };
@@ -130,11 +134,8 @@ pub fn xfrm(ctx: &Ctx, shape: &Shape) -> Xfrm {
 /// Effective fill and the style colour (`phClr`) to resolve it with.
 pub fn fill(ctx: &Ctx, shape: &Shape) -> (Option<Fill>, Option<Rgba>) {
     let (lp, mp) = parents(ctx, shape);
-    for s in [Some(shape), lp, mp].into_iter().flatten() {
-        if let Some(f) = &s.fill {
-            return (Some(f.clone()), None);
-        }
-        if let Some(st) = &s.style {
+    let style_fill = |s: &Shape| {
+        s.style.as_ref().map(|st| {
             let (idx, col) = &st.fill_ref;
             let ph = ctx.color(col, None);
             let f = match *idx {
@@ -142,7 +143,25 @@ pub fn fill(ctx: &Ctx, shape: &Shape) -> (Option<Fill>, Option<Rgba>) {
                 i if i >= 1001 => ctx.master.theme.format.bg_fills.get((i - 1001) as usize).cloned(),
                 i => ctx.master.theme.format.fills.get((i - 1) as usize).cloned(),
             };
-            return (f, Some(ph));
+            (f, Some(ph))
+        })
+    };
+    for s in [Some(shape), lp, mp].into_iter().flatten() {
+        if let Some(f) = &s.fill {
+            // A gradient without stops (`a:gradFill` with no `a:gsLst`) takes them from the
+            // gradient its style refers to, keeping its own direction, as PowerPoint draws it.
+            if let Fill::Gradient(g) = f
+                && g.stops.is_empty()
+                && let Some((Some(Fill::Gradient(sg)), ph)) = style_fill(s)
+            {
+                let mut g = g.clone();
+                g.stops = sg.stops;
+                return (Some(Fill::Gradient(g)), ph);
+            }
+            return (Some(f.clone()), None);
+        }
+        if let Some(r) = style_fill(s) {
+            return r;
         }
     }
     if shape.text_box {
@@ -219,6 +238,7 @@ pub fn body(ctx: &Ctx, shape: &Shape) -> BodyProps {
         columns: Some(1),
         col_spacing: Some(0.0),
         warp: None,
+        warp_adj: Vec::new(),
         rtl_col: Some(false),
         upright: Some(false),
     });

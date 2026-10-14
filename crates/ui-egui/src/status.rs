@@ -129,12 +129,19 @@ pub fn notes_pane(app: &mut SlideApp, ui: &mut Ui) {
             ui.painter()
                 .line_segment([pos2(rect.min.x - 8.0, rect.min.y - 6.0), pos2(rect.max.x + 8.0, rect.min.y - 6.0)], Stroke::new(1.0, t.separator));
             // Keep a local buffer per slide; commit when it changes and the field loses focus.
-            if app.notes_buf.0 != uid || app.notes_buf.1 != idx {
-                app.notes_buf = (uid, idx, current.clone());
-            }
             let id = egui::Id::new("notes_edit");
             let focused = ui.ctx().memory(|m| m.has_focus(id));
-            if !focused && app.notes_buf.2 != current {
+            // Focus can leave in the frame before the field is drawn (Escape, a click on a
+            // thumbnail): what was typed is still committed, to the slide it was typed for.
+            let was_focused = ui.ctx().memory(|m| m.had_focus_last_frame(id));
+            if app.notes_buf.0 != uid || app.notes_buf.1 != idx {
+                let (old_uid, old_idx, typed) = std::mem::replace(&mut app.notes_buf, (uid, idx, current.clone()));
+                let old = app.session.active().and_then(|d| d.doc.slides.get(old_idx)).map(|s| s.notes_text());
+                if was_focused && old_uid == uid && old.is_some_and(|o| o != typed) {
+                    let _ = app.run("slide.notes", json!({"text": typed, "index": old_idx}));
+                }
+            }
+            if !focused && !was_focused && app.notes_buf.2 != current {
                 app.notes_buf.2 = current.clone();
             }
             let mut buf = app.notes_buf.2.clone();

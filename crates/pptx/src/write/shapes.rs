@@ -177,8 +177,24 @@ fn nv_pr(w: &mut W, s: &Shape) {
     }
 }
 
+/// Locking attributes. Lock writes the full set PowerPoint writes for the element's kind (and
+/// reads back as locked): see `read::shapes::is_locked`.
 fn locks(w: &mut W, tag: &str, s: &Shape, extra: A) {
-    let a = extra.t("noGrp", s.ph.is_some()).t("noMove", s.locked).t("noResize", s.locked);
+    let a = extra.t("noGrp", s.ph.is_some() || s.locked);
+    let a = match tag {
+        "a:grpSpLocks" => a.t("noUngrp", s.locked).t("noRot", s.locked).t("noMove", s.locked).t("noResize", s.locked),
+        _ => {
+            let a = a
+                .t("noRot", s.locked)
+                .t("noMove", s.locked)
+                .t("noResize", s.locked)
+                .t("noEditPoints", s.locked)
+                .t("noAdjustHandles", s.locked)
+                .t("noChangeArrowheads", s.locked)
+                .t("noChangeShapeType", s.locked);
+            if tag == "a:picLocks" { a.t("noCrop", s.locked) } else { a }
+        }
+    };
     if a.v.is_empty() {
         return;
     }
@@ -458,7 +474,7 @@ fn frame_open(w: &mut W, x: &mut Exp, o: &mut Out, id: u32, s: &Shape) {
     w.open0("p:nvGraphicFramePr");
     cnvpr(w, x, o, id, s);
     w.open0("p:cNvGraphicFramePr");
-    w.empty("a:graphicFrameLocks", A::new().a("noGrp", "1").t("noMove", s.locked).t("noResize", s.locked));
+    w.empty("a:graphicFrameLocks", A::new().a("noGrp", "1").t("noDrilldown", s.locked).t("noMove", s.locked).t("noResize", s.locked));
     w.close("p:cNvGraphicFramePr");
     nv_pr(w, s);
     w.close("p:nvGraphicFramePr");
@@ -494,6 +510,9 @@ fn table(w: &mut W, x: &mut Exp, o: &mut Out, t: &Table) {
             .t("bandRow", t.band_row)
             .t("bandCol", t.band_col),
     );
+    if let Some(f) = &t.background {
+        dml::fill(w, x, o, f);
+    }
     w.elt("a:tableStyleId", &guid);
     w.close("a:tblPr");
     w.open0("a:tblGrid");

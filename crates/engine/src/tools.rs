@@ -219,6 +219,10 @@ impl Session {
         if st.selection.text.is_none() || st.selection.shapes.len() == 1 {
             for id in st.selection.shapes.iter().rev() {
                 let Some(sh) = st.shape(*id) else { continue };
+                // A locked object shows no live handles: it can't be sized, rotated or reshaped.
+                if sh.locked {
+                    continue;
+                }
                 let x = xfrm_of(&st.doc, &st.selection, sh);
                 if sh.is_line() {
                     let a = x.affine();
@@ -247,8 +251,9 @@ impl Session {
             }
         }
         // Shapes, topmost first.
+        // Locked objects are still picked (to format them or type in them); they just don't move.
         for sh in st.shapes().iter().rev() {
-            if sh.hidden || sh.locked {
+            if sh.hidden {
                 continue;
             }
             if let Some(h) = hit_shape(st, sh, p, tol) {
@@ -264,6 +269,10 @@ impl Session {
         let p = Point::new(ev.x, ev.y);
         if !(p.x.is_finite() && p.y.is_finite()) {
             return Ok(Value::Null);
+        }
+        // A press (not a hover) settles an input method's composition, as clicking does in PowerPoint.
+        if !matches!(ev.kind, PointerKind::Move) {
+            self.end_composition();
         }
         match ev.kind {
             PointerKind::Move => {
@@ -419,7 +428,9 @@ impl Session {
                 } else {
                     vec![id]
                 };
-                let origs: Vec<(ShapeId, Xfrm)> = ids.iter().filter_map(|i| st.shape(*i).map(|s| (*i, xfrm_of(&st.doc, &st.selection, s)))).collect();
+                // Locked objects stay put when the selection is dragged.
+                let origs: Vec<(ShapeId, Xfrm)> =
+                    ids.iter().filter_map(|i| st.shape(*i).filter(|s| !s.locked).map(|s| (*i, xfrm_of(&st.doc, &st.selection, s)))).collect();
                 // A click (no drag) on text puts the caret there; unselected text boxes and
                 // placeholders take the caret straight away like PowerPoint.
                 let enter_text = (text && !toggle && (selected || is_text_first(st, id))).then_some((id, p));
@@ -429,7 +440,8 @@ impl Session {
                     sel.text = None;
                     sel.cells = None;
                 })?;
-                self.tool.drag = Some(Drag::Move { ids, start: p, origs, moved: false, duplicate: mods.alt, enter_text });
+                let duplicate = mods.alt && origs.len() == ids.len();
+                self.tool.drag = Some(Drag::Move { ids, start: p, origs, moved: false, duplicate, enter_text });
                 // Format Painter applies on click.
                 if self.painter.is_some() && !toggle {
                     let _ = self.execute("format.painterApply", &json!({"ids": [id]}));
@@ -460,7 +472,7 @@ impl Session {
         match drag {
             Drag::Move { ids, start, origs, moved, duplicate, enter_text } => {
                 let mut d = p - start;
-                if !moved && d.hypot() < tol.max(1.0) {
+                if !moved && (d.hypot() < tol.max(1.0) || origs.is_empty()) {
                     return Ok(Value::Null);
                 }
                 if !moved {

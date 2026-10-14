@@ -14,24 +14,30 @@
 
 mod easing;
 mod effects;
+mod mesh;
 mod morph;
 mod path;
 mod show;
 mod timeline;
 mod transition;
+mod transition_fx;
+mod transition_geom;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod transition_tests;
 
 pub use deckcraft_model::Rgba;
 use serde::{Deserialize, Serialize};
 
 pub use easing::ease;
+pub use mesh::{MeshVertex, layer_mesh};
 pub use morph::{MorphFrame, MorphPath, MorphText, morph_frame, morph_pairs, morph_xfrm};
 pub use path::{MotionPath, default_path};
 pub use show::{LinkJump, ShowAction, ShowState, safe_url, show_order};
 pub use timeline::{EffectTiming, Sequence, Timeline, TriggerPlay};
-pub use transition::{Layer, Source, transition_layers};
+pub use transition::{DEFAULT_ASPECT, Layer, Source, transition_frame, transition_layers, uses_slide_parts};
 
 /// Animation state of one shape (or one paragraph of a shape's text) at one moment of the show.
 ///

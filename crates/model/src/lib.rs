@@ -11,11 +11,13 @@ pub mod anim;
 pub mod chart;
 pub mod defaults;
 pub mod edit;
+pub mod numfmt;
 pub mod resolve;
 pub mod style;
 pub mod table;
 pub mod text;
 pub mod theme;
+pub mod words;
 
 use std::sync::Arc;
 
@@ -443,6 +445,46 @@ pub fn find_shape_mut(shapes: &mut [Shape], id: ShapeId) -> Option<&mut Shape> {
     rec(shapes, id, 0)
 }
 
+/// The list holding `id` among its siblings: the tree's top level, or a group's children.
+pub fn sibling_list_mut(shapes: &mut Vec<Shape>, id: ShapeId) -> Option<&mut Vec<Shape>> {
+    fn rec(shapes: &mut Vec<Shape>, id: ShapeId, depth: usize) -> Option<&mut Vec<Shape>> {
+        if depth > 64 {
+            return None;
+        }
+        if shapes.iter().any(|s| s.id == id) {
+            return Some(shapes);
+        }
+        for s in shapes.iter_mut() {
+            if let ShapeKind::Group { children, .. } = &mut s.kind
+                && let Some(f) = rec(children, id, depth + 1)
+            {
+                return Some(f);
+            }
+        }
+        None
+    }
+    rec(shapes, id, 0)
+}
+
+/// The group directly holding `id`: `Some(None)` for a top-level shape, `None` when absent.
+pub fn parent_of(shapes: &[Shape], id: ShapeId) -> Option<Option<ShapeId>> {
+    fn rec(shapes: &[Shape], parent: Option<ShapeId>, id: ShapeId, depth: usize) -> Option<Option<ShapeId>> {
+        if depth > 64 {
+            return None;
+        }
+        for s in shapes {
+            if s.id == id {
+                return Some(parent);
+            }
+            if let Some(f) = rec(s.children(), Some(s.id), id, depth + 1) {
+                return Some(f);
+            }
+        }
+        None
+    }
+    rec(shapes, None, id, 0)
+}
+
 /// Background of a slide, layout or master.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
@@ -488,6 +530,10 @@ pub struct Slide {
     /// Speaker notes.
     pub notes: TextBody,
     pub comments: Vec<Comment>,
+    /// `clrMapOvr`: a colour map replacing the layout's or master's (`bg1`→`dk1`…); None follows
+    /// the layout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color_map: Option<Vec<(String, String)>>,
     /// Unmodelled XML kept for round-trip (custom data, tags).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_ext: Option<String>,
@@ -507,6 +553,7 @@ impl Default for Slide {
             animations: vec![],
             notes: TextBody::default(),
             comments: vec![],
+            color_map: None,
             raw_ext: None,
         }
     }
@@ -596,6 +643,10 @@ pub struct Layout {
     pub background: Option<Background>,
     pub show_master_shapes: bool,
     pub preserve: bool,
+    /// `clrMapOvr`: a colour map replacing the master's for this layout and the slides using it
+    /// (dark "section" layouts map `bg1` to `dk1`); None follows the master.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color_map: Option<Vec<(String, String)>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_ext: Option<String>,
 }
@@ -641,24 +692,17 @@ impl Master {
     }
     /// Resolve `bg1`/`tx1`/`bg2`/`tx2` through the colour map.
     pub fn map_slot(&self, slot: SchemeSlot) -> SchemeSlot {
-        let key = match slot {
-            SchemeSlot::Bg1 => "bg1",
-            SchemeSlot::Tx1 => "tx1",
-            SchemeSlot::Bg2 => "bg2",
-            SchemeSlot::Tx2 => "tx2",
-            other => return other,
-        };
-        self.color_map.iter().find(|(k, _)| k == key).and_then(|(_, v)| SchemeSlot::from_xml(v)).unwrap_or(match slot {
-            SchemeSlot::Bg1 => SchemeSlot::Lt1,
-            SchemeSlot::Tx1 => SchemeSlot::Dk1,
-            SchemeSlot::Bg2 => SchemeSlot::Lt2,
-            _ => SchemeSlot::Dk2,
-        })
+        map_slot(&self.color_map, slot)
     }
     /// The theme's colour scheme with the colour map applied (`bg1`… resolve to mapped colours).
     pub fn scheme(&self) -> ColorScheme {
+        self.scheme_with(&self.color_map)
+    }
+    /// The theme's colour scheme with `map` (a layout's or slide's override, or the master's own)
+    /// applied.
+    pub fn scheme_with(&self, map: &[(String, String)]) -> ColorScheme {
         let mut s = self.theme.colors.clone();
-        if self.color_map.is_empty() {
+        if map.is_empty() {
             return s;
         }
         let base = self.theme.colors.clone();
@@ -668,10 +712,28 @@ impl Master {
             (SchemeSlot::Bg2, SchemeSlot::Lt2),
             (SchemeSlot::Tx2, SchemeSlot::Dk2),
         ] {
-            s.set(slot, base.get(self.map_slot(alias)));
+            s.set(slot, base.get(map_slot(map, alias)));
         }
         s
     }
+}
+
+/// Resolve `bg1`/`tx1`/`bg2`/`tx2` through the colour map `map` (the default mapping when it has
+/// no entry).
+pub fn map_slot(map: &[(String, String)], slot: SchemeSlot) -> SchemeSlot {
+    let key = match slot {
+        SchemeSlot::Bg1 => "bg1",
+        SchemeSlot::Tx1 => "tx1",
+        SchemeSlot::Bg2 => "bg2",
+        SchemeSlot::Tx2 => "tx2",
+        other => return other,
+    };
+    map.iter().find(|(k, _)| k == key).and_then(|(_, v)| SchemeSlot::from_xml(v)).unwrap_or(match slot {
+        SchemeSlot::Bg1 => SchemeSlot::Lt1,
+        SchemeSlot::Tx1 => SchemeSlot::Dk1,
+        SchemeSlot::Bg2 => SchemeSlot::Lt2,
+        _ => SchemeSlot::Dk2,
+    })
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -778,6 +840,9 @@ pub struct Presentation {
     pub next_id: u32,
     /// Embedded fonts (family names; bytes in `media`).
     pub embedded_fonts: Vec<(String, MediaId)>,
+    /// Table styles defined in the file (`ppt/tableStyles.xml`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub table_styles: Vec<table::TableStyleDef>,
     /// Unmodelled presentation-level XML kept for round-trip.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_ext: Option<String>,
@@ -792,28 +857,48 @@ impl Default for Presentation {
 impl Presentation {
     /// A fresh id, unique across slides, shapes, layouts, masters and media in this deck.
     pub fn alloc_id(&mut self) -> u32 {
-        self.next_id = self.next_id.max(1).saturating_add(1);
-        self.next_id
+        if self.next_id < u32::MAX {
+            self.next_id = self.next_id.max(1) + 1;
+            return self.next_id;
+        }
+        // A loaded file reached the top of the range. Counting up would hand out the same id
+        // forever, so take the lowest id nothing uses.
+        let mut used = std::collections::BTreeSet::new();
+        self.each_id(&mut |id| {
+            used.insert(id);
+        });
+        let mut free = 1u32;
+        for id in used {
+            if id != free {
+                break;
+            }
+            free = free.saturating_add(1);
+        }
+        free
     }
     /// Make sure `next_id` is above every id in use (after loading a file).
     pub fn fix_next_id(&mut self) {
         let mut m = self.next_id;
+        self.each_id(&mut |id| m = m.max(id));
+        self.next_id = m;
+    }
+    /// Call `f` with every slide, shape, master, layout and media id.
+    fn each_id(&self, f: &mut dyn FnMut(u32)) {
         for s in &self.slides {
-            m = m.max(s.id.0);
-            walk(&s.shapes, &mut |sh, _| m = m.max(sh.id.0));
+            f(s.id.0);
+            walk(&s.shapes, &mut |sh, _| f(sh.id.0));
         }
         for ma in &self.masters {
-            m = m.max(ma.id.0);
-            walk(&ma.shapes, &mut |sh, _| m = m.max(sh.id.0));
+            f(ma.id.0);
+            walk(&ma.shapes, &mut |sh, _| f(sh.id.0));
             for l in &ma.layouts {
-                m = m.max(l.id.0);
-                walk(&l.shapes, &mut |sh, _| m = m.max(sh.id.0));
+                f(l.id.0);
+                walk(&l.shapes, &mut |sh, _| f(sh.id.0));
             }
         }
         for md in &self.media {
-            m = m.max(md.id.0);
+            f(md.id.0);
         }
-        self.next_id = m;
     }
     pub fn slide_index(&self, id: SlideId) -> Option<usize> {
         self.slides.iter().position(|s| s.id == id)

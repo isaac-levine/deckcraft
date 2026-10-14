@@ -76,40 +76,7 @@ pub fn fill(w: &mut W, x: &mut Exp, o: &mut Out, f: &Fill) {
     match f {
         Fill::None => w.empty0("a:noFill"),
         Fill::Solid { color: c } => solid(w, c),
-        Fill::Gradient(g) => {
-            w.open("a:gradFill", A::new().a("rotWithShape", if g.rotate_with_shape { "1" } else { "0" }));
-            w.open0("a:gsLst");
-            let mut stops = g.stops.clone();
-            if stops.is_empty() {
-                stops.push(deckcraft_model::style::GradientStop { pos: 0.0, color: ColorRef::rgb(deckcraft_color::Rgba::WHITE) });
-            }
-            if stops.len() == 1 {
-                let mut s = stops[0].clone();
-                s.pos = 1.0;
-                stops.push(s);
-            }
-            for s in &stops {
-                w.open("a:gs", A::new().a("pos", pct(s.pos.clamp(0.0, 1.0))));
-                color(w, &s.color);
-                w.close("a:gs");
-            }
-            w.close("a:gsLst");
-            match &g.shape {
-                GradientShape::Linear { angle, scaled } => {
-                    w.empty("a:lin", A::new().a("ang", ang(*angle)).a("scaled", if *scaled { "1" } else { "0" }))
-                }
-                GradientShape::Path { path, focus } => {
-                    let p = match path.as_str() {
-                        "rect" | "shape" | "circle" => path.as_str(),
-                        _ => "circle",
-                    };
-                    w.open("a:path", A::new().a("path", p));
-                    w.empty("a:fillToRect", A::new().a("l", pct(focus[0])).a("t", pct(focus[1])).a("r", pct(focus[2])).a("b", pct(focus[3])));
-                    w.close("a:path");
-                }
-            }
-            w.close("a:gradFill");
-        }
+        Fill::Gradient(g) => gradient(w, g),
         Fill::Picture(pf) => blip_fill(w, x, o, "a:blipFill", pf),
         Fill::Pattern(p) => {
             w.open("a:pattFill", A::new().a("prst", if p.preset.is_empty() { "pct5" } else { &p.preset }));
@@ -129,10 +96,16 @@ pub fn fill(w: &mut W, x: &mut Exp, o: &mut Out, f: &Fill) {
 /// `a:blipFill` / `p:blipFill`.
 pub fn blip_fill(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, pf: &PictureFill) {
     let rid = x.media_rel(o, pf.media, "image").unwrap_or_else(|| x.placeholder_rel(o));
-    w.open(tag, A::new().a("rotWithShape", "1"));
+    w.open(tag, A::new().a("rotWithShape", if pf.upright { "0" } else { "1" }));
     let adj = &pf.adjust;
-    let has_kids =
-        pf.alpha.is_some() || adj.brightness != 0.0 || adj.contrast != 0.0 || adj.grayscale || adj.duotone.is_some() || adj.clear_color.is_some();
+    let has_kids = pf.alpha.is_some()
+        || adj.brightness != 0.0
+        || adj.contrast != 0.0
+        || adj.grayscale
+        || adj.duotone.is_some()
+        || adj.clear_color.is_some()
+        || adj.bilevel.is_some()
+        || adj.alpha_inv;
     let a = A::new().a("r:embed", &rid);
     if has_kids {
         w.open("a:blip", a);
@@ -148,6 +121,12 @@ pub fn blip_fill(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, pf: &PictureFil
         }
         if let Some(al) = pf.alpha {
             w.empty("a:alphaModFix", A::new().a("amt", pct(al.clamp(0.0, 1.0))));
+        }
+        if adj.alpha_inv {
+            w.empty0("a:alphaInv");
+        }
+        if let Some(t) = adj.bilevel {
+            w.empty("a:biLevel", A::new().a("thresh", pct(t.clamp(0.0, 1.0))));
         }
         if let Some((d, l)) = &adj.duotone {
             w.open0("a:duotone");
@@ -275,8 +254,59 @@ fn shadow(w: &mut W, tag: &str, s: &deckcraft_model::style::Shadow) {
     w.close(tag);
 }
 
+fn gradient(w: &mut W, g: &deckcraft_model::style::Gradient) {
+    w.open("a:gradFill", A::new().a("rotWithShape", if g.rotate_with_shape { "1" } else { "0" }));
+    // No stops: no `a:gsLst`, so the gradient keeps taking them from its style's fill.
+    let mut stops = g.stops.clone();
+    if stops.len() == 1 {
+        let mut s = stops[0].clone();
+        s.pos = 1.0;
+        stops.push(s);
+    }
+    if !stops.is_empty() {
+        w.open0("a:gsLst");
+        for s in &stops {
+            w.open("a:gs", A::new().a("pos", pct(s.pos.clamp(0.0, 1.0))));
+            color(w, &s.color);
+            w.close("a:gs");
+        }
+        w.close("a:gsLst");
+    }
+    match &g.shape {
+        GradientShape::Linear { angle, scaled } => w.empty("a:lin", A::new().a("ang", ang(*angle)).a("scaled", if *scaled { "1" } else { "0" })),
+        GradientShape::Path { path, focus } => {
+            let p = match path.as_str() {
+                "rect" | "shape" | "circle" => path.as_str(),
+                _ => "circle",
+            };
+            w.open("a:path", A::new().a("path", p));
+            w.empty("a:fillToRect", A::new().a("l", pct(focus[0])).a("t", pct(focus[1])).a("r", pct(focus[2])).a("b", pct(focus[3])));
+            w.close("a:path");
+        }
+    }
+    if g.tile.iter().any(|v| *v != 0.0) {
+        let [l, t, r, b] = g.tile;
+        w.empty("a:tileRect", A::new().a("l", pct(l)).a("t", pct(t)).a("r", pct(r)).a("b", pct(b)));
+    }
+    w.close("a:gradFill");
+}
+
 pub fn effects(w: &mut W, fx: &Effects) {
     w.open0("a:effectLst");
+    // Schema order: blur, fillOverlay, glow, innerShdw, outerShdw, prstShdw, reflection, softEdge.
+    if let Some(ov) = &fx.fill_overlay {
+        let blend = match ov.blend.as_str() {
+            b @ ("over" | "mult" | "screen" | "darken" | "lighten") => b,
+            _ => "over",
+        };
+        w.open("a:fillOverlay", A::new().a("blend", blend));
+        match &ov.fill {
+            Fill::Solid { color: c } => solid(w, c),
+            Fill::Gradient(g) => gradient(w, g),
+            _ => w.empty0("a:noFill"),
+        }
+        w.close("a:fillOverlay");
+    }
     if let Some(g) = &fx.glow {
         w.open("a:glow", A::new().a("rad", emu(g.radius).max(0)));
         color(w, &g.color);
@@ -392,7 +422,19 @@ pub fn body_pr(w: &mut W, b: &BodyProps) {
     w.open("a:bodyPr", a);
     if let Some(p) = warp {
         w.open("a:prstTxWarp", A::new().a("prst", p));
-        w.empty0("a:avLst");
+        let adj: Vec<(usize, i64)> =
+            b.warp_adj.iter().take(8).enumerate().filter(|(_, v)| v.is_finite()).map(|(i, v)| (i, v.round().clamp(-2.0e9, 2.0e9) as i64)).collect();
+        if adj.is_empty() {
+            w.empty0("a:avLst");
+        } else {
+            let single = deckcraft_geom::warp::adjust_count(p) <= 1 && b.warp_adj.len() == 1;
+            w.open0("a:avLst");
+            for (i, v) in adj {
+                let n = if single { "adj".to_string() } else { format!("adj{}", i + 1) };
+                w.empty("a:gd", A::new().a("name", n).a("fmla", format!("val {v}")));
+            }
+            w.close("a:avLst");
+        }
         w.close("a:prstTxWarp");
     }
     match b.autofit {
@@ -432,6 +474,8 @@ pub fn ppr(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, level: Option<u8>, p:
         .o("defTabSz", p.default_tab.map(|v| emu(v).max(0)))
         .b("rtl", p.rtl)
         .b("eaLnBrk", p.east_asian_line_break)
+        .b("latinLnBrk", p.latin_line_break)
+        .b("hangingPunct", p.hanging_punct)
         .o("fontAlgn", p.font_align.as_deref().filter(|f| matches!(*f, "auto" | "t" | "ctr" | "base" | "b")));
     let has_kids = p.line_spacing.is_some()
         || p.space_before.is_some()

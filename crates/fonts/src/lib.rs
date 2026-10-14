@@ -13,8 +13,10 @@ mod fontdb;
 pub mod script;
 mod shape;
 
-pub use fallback::{bundled_families, covers_cluster, ligature_carets};
-pub use fontdb::{FALLBACK_FAMILY, FaceRef, FontDb, FontFace, LAST_RESORT_FAMILY, base_style, bundled, substitutes, system_font_dirs};
+pub use fallback::{bundled_families, covers_cluster, is_emoji_cluster, ligature_carets};
+pub use fontdb::{
+    FALLBACK_FAMILY, FaceRef, FontDb, FontFace, LAST_RESORT_FAMILY, MISSING_FONT_FAMILY, base_style, bundled, substitutes, system_font_dirs,
+};
 pub use harfrust::Feature;
 use harfrust::Tag;
 pub use kurbo::BezPath;
@@ -137,10 +139,45 @@ mod tests {
     }
 
     #[test]
+    fn emoji_clusters_are_recognised() {
+        let c = |s: &str| s.chars().collect::<Vec<char>>();
+        // As PowerPoint draws them: emoji-presentation characters (⭐ ✅ ☔ ⌚ ⏩) in colour even
+        // without a selector, text-presentation ones (♥ ✔ ☎ ⬆ ▶) as text unless U+FE0F asks, and
+        // keycaps always as text.
+        for yes in ["😀", "👍🏽", "❤\u{FE0F}", "👨\u{200D}👩\u{200D}👧", "🇯🇵", "🏳\u{FE0F}\u{200D}🌈", "⭐", "✅", "☔", "⌚", "⏩", "🀄"]
+        {
+            assert!(is_emoji_cluster(&c(yes)), "{yes:?}");
+        }
+        for no in ["a", "1", "❤", "☺\u{FE0E}", "😀\u{FE0E}", "字", "→", "♥", "✔", "☎", "⬆", "▶", "1\u{FE0F}\u{20E3}", "#\u{20E3}"]
+        {
+            assert!(!is_emoji_cluster(&c(no)), "{no:?}");
+        }
+    }
+
+    #[test]
+    fn colour_fonts_are_recognised() {
+        let db = FontDb::with_font_dirs(Vec::new());
+        assert!(db.add_font(include_bytes!("../../render/tests/fixtures/colr-squares.ttf").to_vec()) > 0);
+        assert!(db.face("DeckCraft Colr Squares", "Regular").is_color());
+        assert!(!fontdb::last_resort_face().is_color());
+    }
+
+    #[test]
     fn last_resort_face_parses() {
         let f = fontdb::last_resort_face();
         assert_eq!(f.family, fontdb::LAST_RESORT_FAMILY);
         assert!(f.upem > 0.0);
+    }
+
+    #[test]
+    fn line_split_follows_the_windows_ascent_and_descent() {
+        use skrifa::raw::TableProvider;
+        let f = fontdb::last_resort_face();
+        let font = skrifa::FontRef::new(f.data()).unwrap();
+        let os2 = font.os2().unwrap();
+        let (a, d) = (os2.us_win_ascent() as f64, os2.us_win_descent() as f64);
+        assert!((f.line_split - a / (a + d)).abs() < 1e-9, "{} vs {}", f.line_split, a / (a + d));
+        assert!(f.line_split > 0.5 && f.line_split < 1.0);
     }
 
     #[test]
@@ -150,6 +187,65 @@ mod tests {
         let f = db.face("No Such Font Anywhere", "Regular");
         assert!(!f.family.is_empty());
         assert!(!shape(&f, "Hello", &[], |c| c).is_empty());
+    }
+
+    #[test]
+    fn windows_family_names_find_their_faces() {
+        // Documents name fonts by their Windows family ("Segoe UI Semibold"); the font's
+        // typographic family is "Segoe UI" with a "Semibold" style. The fixture is named the same way.
+        let check = |db: &FontDb| {
+            assert!(db.has_family("DeckCraft Legacy Semibold"));
+            for style in ["Regular", "Bold"] {
+                let f = db.face("DeckCraft Legacy Semibold", style);
+                assert_eq!((f.family.as_str(), f.style.as_str()), ("DeckCraft Legacy", "Semibold"), "{style}");
+            }
+            assert_eq!(db.document_face("DeckCraft Legacy Semibold", "Regular").family, "DeckCraft Legacy", "installed, so not Calibri");
+            // The typographic name still works.
+            assert_eq!(db.face("DeckCraft Legacy", "Semibold").style, "Semibold");
+        };
+        // Loaded directly…
+        let db = FontDb::with_font_dirs(Vec::new());
+        db.set_system_fallback(false);
+        assert_eq!(db.add_font(include_bytes!("../tests/fixtures/legacy-semibold.ttf").to_vec()), 1);
+        check(&db);
+        // …and found by the system font scan under its Windows name, then loaded.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+            let db = FontDb::with_font_dirs(vec![dir.clone()]);
+            db.set_system_fallback(false);
+            check(&db);
+            // Looking up the Windows name loads the Semibold file only; a later lookup of the
+            // family's Regular must still load and pick the Regular file, not settle for Semibold.
+            let db = FontDb::with_font_dirs(vec![dir]);
+            db.set_system_fallback(false);
+            assert_eq!(db.face("DeckCraft Legacy Semibold", "Regular").style, "Semibold");
+            let regular = db.face("DeckCraft Legacy", "Regular");
+            assert_eq!((regular.style.as_str(), regular.weight), ("Regular", 400.0));
+        }
+    }
+
+    #[test]
+    fn missing_document_fonts_are_drawn_in_calibri() {
+        // PowerPoint draws a missing family in Calibri, whatever its panose or the theme says.
+        let db = FontDb::global();
+        for missing in ["Qqq Nonexistent", "Avenir Next Qqq", "", "Arimo Qqq"] {
+            let f = db.document_face(missing, "Bold");
+            assert_eq!(f.family, db.face(MISSING_FONT_FAMILY, "Bold").family, "{missing:?}");
+        }
+        // PowerPoint's own twins and Windows' substitutes, when the font itself is missing.
+        for (missing, twin) in
+            [("Liberation Sans", "Arial"), ("Liberation Serif", "Times New Roman"), ("Arial CE", "Arial"), ("Times New Roman CYR", "Times New Roman")]
+        {
+            if !db.has_family(missing) {
+                assert_eq!(db.document_face(missing, "Regular").family, db.face(twin, "Regular").family, "{missing}");
+            }
+        }
+        // Metric-compatible stand-ins and DeckCraft's default keep their own fallbacks.
+        // So do Office's cloud fonts, which PowerPoint downloads and draws as themselves.
+        for kept in ["Arial", "Times New Roman", "Cambria", "Courier New", FALLBACK_FAMILY, "Aptos", "Aptos Display", "Grandview"] {
+            assert_eq!(db.document_face(kept, "Regular").family, db.face(kept, "Regular").family, "{kept}");
+        }
     }
 
     #[test]

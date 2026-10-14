@@ -87,6 +87,22 @@ pub fn sp_tree(imp: &mut Imp, part: &Part, ctx: &mut IdCtx, tree: &El, depth: us
     out
 }
 
+/// ActiveX controls (`p:controls`): each control's picture (`p:pic`), the image PowerPoint shows
+/// for it, as a picture above the slide's shapes. Controls without one are left out.
+pub fn controls(imp: &mut Imp, part: &Part, ctx: &mut IdCtx, controls: &El) -> Vec<Shape> {
+    let mut out = vec![];
+    for c in controls.children_named("control") {
+        if ctx.count >= MAX_SHAPES {
+            break;
+        }
+        if let Some(p) = c.child("pic") {
+            ctx.count += 1;
+            out.push(pic(imp, part, ctx, p));
+        }
+    }
+    out
+}
+
 fn remap_connectors(shapes: &mut [Shape], ctx: &IdCtx, depth: usize) {
     if depth > MAX_TREE_DEPTH {
         return;
@@ -102,6 +118,18 @@ fn remap_connectors(shapes: &mut [Shape], ctx: &IdCtx, depth: usize) {
             _ => {}
         }
     }
+}
+
+/// PowerPoint's Lock (right-click > Lock, the Selection pane padlock) writes a full set of locking
+/// attributes; it reads an object as locked only when the whole set for its kind is there, so a
+/// lone `noMove` or `noResize` (other tools' partial locks) isn't Lock.
+fn is_locked(l: &El) -> bool {
+    let set: &[&str] = match l.local() {
+        "grpSpLocks" => &["noGrp", "noUngrp", "noRot", "noMove", "noResize"],
+        "graphicFrameLocks" => &["noGrp", "noDrilldown", "noMove", "noResize"],
+        _ => &["noGrp", "noRot", "noMove", "noResize", "noEditPoints", "noAdjustHandles", "noChangeArrowheads", "noChangeShapeType"],
+    };
+    set.iter().all(|a| l.bool(a) == Some(true))
 }
 
 /// Common non-visual properties (`p:nvSpPr`, `p:nvPicPr`…).
@@ -122,10 +150,10 @@ fn base(imp: &mut Imp, part: &Part, ctx: &mut IdCtx, nv: Option<&El>) -> Shape {
             match e.local() {
                 "cNvSpPr" => {
                     s.text_box = e.bool("txBox").unwrap_or(false);
-                    s.locked = e.child("spLocks").is_some_and(|l| l.bool("noMove") == Some(true) && l.bool("noResize") == Some(true));
+                    s.locked = e.child("spLocks").is_some_and(is_locked);
                 }
                 "cNvPicPr" | "cNvGrpSpPr" | "cNvCxnSpPr" | "cNvGraphicFramePr" => {
-                    s.locked = e.elements().next().is_some_and(|l| l.bool("noMove") == Some(true) && l.bool("noResize") == Some(true));
+                    s.locked = e.elements().find(|l| l.local().ends_with("Locks")).is_some_and(is_locked);
                 }
                 "nvPr" => {
                     if let Some(ph) = e.child("ph") {
@@ -180,6 +208,15 @@ fn preset_geom(pg: &El) -> Geom {
     Geom::Preset { name, adj }
 }
 
+/// A placeholder whose `spPr` names no geometry takes its layout's (or master's) placeholder's:
+/// marked here with an empty custom geometry, filled in once the layouts are read
+/// (`inherit_placeholder_geometry`).
+fn mark_inherited_geometry(s: &mut Shape, pr: Option<&El>) {
+    if s.ph.is_some() && pr.is_none_or(|pr| pr.child("prstGeom").is_none() && pr.child("custGeom").is_none()) {
+        s.geom = Geom::Custom { paths: vec![] };
+    }
+}
+
 /// `spPr` → transform, geometry, fill, line, effects.
 fn sp_pr(imp: &mut Imp, part: &Part, s: &mut Shape, pr: &El) {
     if let Some(x) = pr.child("xfrm") {
@@ -229,6 +266,7 @@ fn sp(imp: &mut Imp, part: &Part, ctx: &mut IdCtx, e: &El) -> Shape {
     if let Some(pr) = e.child("spPr") {
         sp_pr(imp, part, &mut s, pr);
     }
+    mark_inherited_geometry(&mut s, e.child("spPr"));
     if e.bool("useBgFill") == Some(true) {
         s.fill = Some(Fill::Background);
     }
@@ -346,7 +384,8 @@ fn frame(imp: &mut Imp, part: &Part, ctx: &mut IdCtx, e: &El, depth: usize) -> S
         let mut pics = vec![];
         e.find_all("blip", &mut pics);
         pics.into_iter().find_map(|b| dml::media_ref(imp, part, b))
-    };
+    }
+    .or_else(|| gd.and_then(|g| g.find("oleObj")).and_then(|o| vml_preview(imp, part, o.attr("spid")?)));
     let label = if let Some(o) = gd.and_then(|g| g.find("oleObj")) {
         o.attr("progId").or(o.attr("name")).unwrap_or("Object").to_string()
     } else if uri.ends_with("/diagram") {
@@ -358,6 +397,21 @@ fn frame(imp: &mut Imp, part: &Part, ctx: &mut IdCtx, e: &El, depth: usize) -> S
     };
     s.kind = ShapeKind::Opaque { xml: part.keep(e), preview, label };
     s
+}
+
+/// The preview picture of an old-style embedded object (`p:oleObj spid` with no `p:pic`): the
+/// `v:imagedata` of the legacy VML drawing shape with that id, as PowerPoint 2007 wrote them.
+fn vml_preview(imp: &mut Imp, part: &Part, spid: &str) -> Option<deckcraft_model::MediaId> {
+    for rel in part.rels.items.iter().filter(|r| r.kind == "vmlDrawing" && !r.external) {
+        let Some(doc) = imp.pkg.xml(&rel.target) else { continue };
+        let mut shapes = vec![];
+        doc.root.find_all("shape", &mut shapes);
+        let Some(img) = shapes.into_iter().find(|s| s.attr("id") == Some(spid)).and_then(|s| s.find("imagedata")) else { continue };
+        let Some(id) = img.attr("o:relid").or(img.attr("r:id")) else { continue };
+        let target = imp.pkg.rels(&rel.target).get(id).filter(|r| !r.external).map(|r| r.target.clone())?;
+        return imp.media_for(&target);
+    }
+    None
 }
 
 /// SmartArt: read the pre-drawn shapes of its drawing part as a group.
@@ -382,8 +436,11 @@ fn smartart(imp: &mut Imp, part: &Part, gd: &El, frame: &Shape, depth: usize) ->
 }
 
 fn table(imp: &mut Imp, part: &Part, tbl: &El) -> Table {
-    let mut t = Table { style: "none".into(), first_row: false, band_row: false, ..Default::default() };
+    // A table naming no style is drawn by PowerPoint with thin dark grid lines ("No Style, Table
+    // Grid"), not without lines.
+    let mut t = Table { style: "grid".into(), first_row: false, band_row: false, ..Default::default() };
     if let Some(pr) = tbl.child("tblPr") {
+        t.background = pr.elements().find(|e| e.local().ends_with("Fill") && e.local() != "noFill").and_then(|f| dml::fill_el(imp, part, f));
         t.first_row = pr.bool("firstRow").unwrap_or(false);
         t.first_col = pr.bool("firstCol").unwrap_or(false);
         t.last_row = pr.bool("lastRow").unwrap_or(false);
@@ -391,7 +448,11 @@ fn table(imp: &mut Imp, part: &Part, tbl: &El) -> Table {
         t.band_row = pr.bool("bandRow").unwrap_or(false);
         t.band_col = pr.bool("bandCol").unwrap_or(false);
         if let Some(id) = pr.child("tableStyleId").map(|e| e.text()) {
-            t.style = crate::tables::style_from_guid(id.trim());
+            // A style the file defines is drawn from its definition (by its GUID).
+            // DeckCraft's own styles (written with GUIDs derived from their ids) map back to them.
+            let up = id.trim().to_ascii_uppercase();
+            t.style =
+                if imp.table_style_ids.contains(&up) && !crate::tables::is_own_guid(&up) { up } else { crate::tables::style_from_guid(id.trim()) };
         }
     }
     t.cols = tbl

@@ -227,6 +227,21 @@ const CLR_KEYS: [(&str, &str); 12] = [
 ];
 
 fn clr_map(w: &mut W, map: &[(String, String)]) {
+    w.empty("p:clrMap", clr_map_attrs(map));
+}
+
+/// `p:clrMapOvr`: the layout's or slide's own colour map, else `a:masterClrMapping`.
+fn clr_map_ovr(w: &mut W, map: Option<&[(String, String)]>) {
+    w.open0("p:clrMapOvr");
+    match map {
+        Some(m) => w.empty("a:overrideClrMapping", clr_map_attrs(m)),
+        None => w.empty0("a:masterClrMapping"),
+    }
+    w.close("p:clrMapOvr");
+}
+
+/// The twelve colour map attributes, each a theme slot (the default for anything else).
+fn clr_map_attrs(map: &[(String, String)]) -> A {
     let mut a = A::new();
     for (k, d) in CLR_KEYS {
         let v = map
@@ -237,7 +252,7 @@ fn clr_map(w: &mut W, map: &[(String, String)]) {
             .unwrap_or(d);
         a = a.a(k, v);
     }
-    w.empty("p:clrMap", a);
+    a
 }
 
 fn ext_list(w: &mut W, raw: Option<&str>) {
@@ -497,7 +512,7 @@ pub fn export(p: &Presentation) -> Result<Vec<u8>, PptxError> {
     pres.rels.add("tableStyles", "tableStyles.xml", false);
     x.pkg.xml_part("ppt/presProps.xml", CT_PRES_PROPS, pres_props_xml(p));
     x.pkg.xml_part("ppt/viewProps.xml", CT_VIEW_PROPS, view_props_xml());
-    let ts = crate::tables::table_styles_xml(&x.table_styles);
+    let ts = crate::tables::table_styles_xml(&x.table_styles, &p.table_styles);
     x.pkg.xml_part("ppt/tableStyles.xml", CT_TABLE_STYLES, ts);
     let pxml = presentation_xml(&mut x, &mut pres, &master_rids, notes_master_rid.as_deref(), &slide_rids);
     x.pkg.xml_part("ppt/presentation.xml", CT_PRES, pxml);
@@ -522,9 +537,7 @@ fn layout_xml(x: &mut Exp, o: &mut Out, l: &Layout) -> Vec<u8> {
         A::new().o("showMasterSp", (!l.show_master_shapes).then_some("0")).a("type", l.kind.xml()).t("preserve", l.preserve),
     );
     csld(&mut w, x, o, &l.name, l.background.as_ref(), &l.shapes);
-    w.open0("p:clrMapOvr");
-    w.empty0("a:masterClrMapping");
-    w.close("p:clrMapOvr");
+    clr_map_ovr(&mut w, l.color_map.as_deref());
     ext_list(&mut w, ext_children(l.raw_ext.as_deref()).as_deref());
     w.close("p:sldLayout");
     w.finish()
@@ -556,9 +569,7 @@ fn slide_xml(x: &mut Exp, o: &mut Out, s: &Slide) -> Vec<u8> {
     let mut w = W::new();
     root_open(&mut w, "p:sld", A::new().o("showMasterSp", (!s.show_master_shapes).then_some("0")).o("show", s.hidden.then_some("0")));
     let ids = csld(&mut w, x, o, &s.name, s.background.as_ref(), &s.shapes);
-    w.open0("p:clrMapOvr");
-    w.empty0("a:masterClrMapping");
-    w.close("p:clrMapOvr");
+    clr_map_ovr(&mut w, s.color_map.as_deref());
     if let Some(t) = &s.transition {
         timing::transition(&mut w, x, o, t);
     }

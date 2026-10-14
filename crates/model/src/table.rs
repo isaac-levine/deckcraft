@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::style::{Fill, Line};
+use crate::style::{ColorRef, Fill, Line};
 use crate::text::{Anchor, TextBody};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -55,6 +55,9 @@ pub struct Table {
     pub last_col: bool,
     pub band_row: bool,
     pub band_col: bool,
+    /// `a:tblPr` fill: a fill behind the whole table (over the style's own background).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<Fill>,
 }
 
 impl Default for Table {
@@ -69,6 +72,7 @@ impl Default for Table {
             last_col: false,
             band_row: true,
             band_col: false,
+            background: None,
         }
     }
 }
@@ -197,6 +201,110 @@ impl Table {
             }
         }
     }
+}
+
+/// A table style defined in the file (`ppt/tableStyles.xml`), as PowerPoint writes the built-in
+/// styles a deck uses: how each part of a table (whole table, banded rows and columns, first and
+/// last rows and columns, corner cells) is filled, bordered and lettered.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TableStyleDef {
+    /// The style's GUID (`a:tableStyleId` on tables).
+    pub id: String,
+    pub name: String,
+    pub parts: Vec<(TablePart, TablePartStyle)>,
+    /// `a:tblBg`: a fill behind the whole table (only `fill` and `fill_ref` are used).
+    pub background: Option<TablePartStyle>,
+    /// The definition as read, written back unchanged.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub raw: String,
+}
+
+impl TableStyleDef {
+    pub fn part(&self, p: TablePart) -> Option<&TablePartStyle> {
+        self.parts.iter().find(|(k, _)| *k == p).map(|(_, s)| s)
+    }
+}
+
+/// The parts of a table style, in the order they apply (later ones win).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TablePart {
+    WholeTbl,
+    Band1H,
+    Band2H,
+    Band1V,
+    Band2V,
+    LastCol,
+    FirstCol,
+    LastRow,
+    FirstRow,
+    SeCell,
+    SwCell,
+    NeCell,
+    NwCell,
+}
+
+impl TablePart {
+    pub const ALL: [TablePart; 13] = [
+        TablePart::WholeTbl,
+        TablePart::Band1H,
+        TablePart::Band2H,
+        TablePart::Band1V,
+        TablePart::Band2V,
+        TablePart::LastCol,
+        TablePart::FirstCol,
+        TablePart::LastRow,
+        TablePart::FirstRow,
+        TablePart::SeCell,
+        TablePart::SwCell,
+        TablePart::NeCell,
+        TablePart::NwCell,
+    ];
+
+    pub fn xml(self) -> &'static str {
+        match self {
+            TablePart::WholeTbl => "wholeTbl",
+            TablePart::Band1H => "band1H",
+            TablePart::Band2H => "band2H",
+            TablePart::Band1V => "band1V",
+            TablePart::Band2V => "band2V",
+            TablePart::LastCol => "lastCol",
+            TablePart::FirstCol => "firstCol",
+            TablePart::LastRow => "lastRow",
+            TablePart::FirstRow => "firstRow",
+            TablePart::SeCell => "seCell",
+            TablePart::SwCell => "swCell",
+            TablePart::NeCell => "neCell",
+            TablePart::NwCell => "nwCell",
+        }
+    }
+
+    pub fn from_xml(s: &str) -> Option<TablePart> {
+        TablePart::ALL.into_iter().find(|p| p.xml() == s)
+    }
+}
+
+/// One part of a table style. A theme reference (`a:fillRef`, `a:lnRef`) is kept as the theme's
+/// style index with its colour.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TablePartStyle {
+    pub fill: Option<Fill>,
+    pub fill_ref: Option<(u32, ColorRef)>,
+    /// Left, right, top, bottom, inside horizontal, inside vertical.
+    pub borders: [Option<TableBorder>; 6],
+    pub text_color: Option<ColorRef>,
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+}
+
+/// A border of a table style part: a line, or a theme line style reference.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum TableBorder {
+    Line { line: Line },
+    Ref { idx: u32, color: ColorRef },
 }
 
 /// Built-in table styles: (id, label). Styles are generated from the theme accents.
