@@ -98,6 +98,25 @@ fn serde_roundtrip() {
 }
 
 #[test]
+fn alloc_id_stays_unique_when_next_id_is_at_the_maximum() {
+    let mut p = Presentation::default();
+    // A hostile or damaged file declares the largest id.
+    Arc::make_mut(&mut p.slides[0]).shapes[0].id = ShapeId(u32::MAX);
+    p.fix_next_id();
+    assert_eq!(p.next_id, u32::MAX);
+    let mut used = std::collections::HashSet::new();
+    p.each_id(&mut |id| {
+        used.insert(id);
+    });
+    for _ in 0..5 {
+        let id = p.alloc_id();
+        assert!(used.insert(id), "id {id} handed out twice");
+        // Give the id to a shape so the next allocation sees it as taken.
+        p.media.push(MediaItem { id: MediaId(id), ..Default::default() });
+    }
+}
+
+#[test]
 fn ids_are_unique_and_fix_next_id() {
     let mut p = Presentation::default();
     let a = p.alloc_id();

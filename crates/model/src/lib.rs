@@ -857,28 +857,48 @@ impl Default for Presentation {
 impl Presentation {
     /// A fresh id, unique across slides, shapes, layouts, masters and media in this deck.
     pub fn alloc_id(&mut self) -> u32 {
-        self.next_id = self.next_id.max(1).saturating_add(1);
-        self.next_id
+        if self.next_id < u32::MAX {
+            self.next_id = self.next_id.max(1) + 1;
+            return self.next_id;
+        }
+        // A loaded file reached the top of the range. Counting up would hand out the same id
+        // forever, so take the lowest id nothing uses.
+        let mut used = std::collections::BTreeSet::new();
+        self.each_id(&mut |id| {
+            used.insert(id);
+        });
+        let mut free = 1u32;
+        for id in used {
+            if id != free {
+                break;
+            }
+            free = free.saturating_add(1);
+        }
+        free
     }
     /// Make sure `next_id` is above every id in use (after loading a file).
     pub fn fix_next_id(&mut self) {
         let mut m = self.next_id;
+        self.each_id(&mut |id| m = m.max(id));
+        self.next_id = m;
+    }
+    /// Call `f` with every slide, shape, master, layout and media id.
+    fn each_id(&self, f: &mut dyn FnMut(u32)) {
         for s in &self.slides {
-            m = m.max(s.id.0);
-            walk(&s.shapes, &mut |sh, _| m = m.max(sh.id.0));
+            f(s.id.0);
+            walk(&s.shapes, &mut |sh, _| f(sh.id.0));
         }
         for ma in &self.masters {
-            m = m.max(ma.id.0);
-            walk(&ma.shapes, &mut |sh, _| m = m.max(sh.id.0));
+            f(ma.id.0);
+            walk(&ma.shapes, &mut |sh, _| f(sh.id.0));
             for l in &ma.layouts {
-                m = m.max(l.id.0);
-                walk(&l.shapes, &mut |sh, _| m = m.max(sh.id.0));
+                f(l.id.0);
+                walk(&l.shapes, &mut |sh, _| f(sh.id.0));
             }
         }
         for md in &self.media {
-            m = m.max(md.id.0);
+            f(md.id.0);
         }
-        self.next_id = m;
     }
     pub fn slide_index(&self, id: SlideId) -> Option<usize> {
         self.slides.iter().position(|s| s.id == id)
