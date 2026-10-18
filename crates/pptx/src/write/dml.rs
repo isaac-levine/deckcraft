@@ -76,40 +76,7 @@ pub fn fill(w: &mut W, x: &mut Exp, o: &mut Out, f: &Fill) {
     match f {
         Fill::None => w.empty0("a:noFill"),
         Fill::Solid { color: c } => solid(w, c),
-        Fill::Gradient(g) => {
-            w.open("a:gradFill", A::new().a("rotWithShape", if g.rotate_with_shape { "1" } else { "0" }));
-            w.open0("a:gsLst");
-            let mut stops = g.stops.clone();
-            if stops.is_empty() {
-                stops.push(deckcraft_model::style::GradientStop { pos: 0.0, color: ColorRef::rgb(deckcraft_color::Rgba::WHITE) });
-            }
-            if stops.len() == 1 {
-                let mut s = stops[0].clone();
-                s.pos = 1.0;
-                stops.push(s);
-            }
-            for s in &stops {
-                w.open("a:gs", A::new().a("pos", pct(s.pos.clamp(0.0, 1.0))));
-                color(w, &s.color);
-                w.close("a:gs");
-            }
-            w.close("a:gsLst");
-            match &g.shape {
-                GradientShape::Linear { angle, scaled } => {
-                    w.empty("a:lin", A::new().a("ang", ang(*angle)).a("scaled", if *scaled { "1" } else { "0" }))
-                }
-                GradientShape::Path { path, focus } => {
-                    let p = match path.as_str() {
-                        "rect" | "shape" | "circle" => path.as_str(),
-                        _ => "circle",
-                    };
-                    w.open("a:path", A::new().a("path", p));
-                    w.empty("a:fillToRect", A::new().a("l", pct(focus[0])).a("t", pct(focus[1])).a("r", pct(focus[2])).a("b", pct(focus[3])));
-                    w.close("a:path");
-                }
-            }
-            w.close("a:gradFill");
-        }
+        Fill::Gradient(g) => gradient(w, g),
         Fill::Picture(pf) => blip_fill(w, x, o, "a:blipFill", pf),
         Fill::Pattern(p) => {
             w.open("a:pattFill", A::new().a("prst", if p.preset.is_empty() { "pct5" } else { &p.preset }));
@@ -128,12 +95,22 @@ pub fn fill(w: &mut W, x: &mut Exp, o: &mut Out, f: &Fill) {
 
 /// `a:blipFill` / `p:blipFill`.
 pub fn blip_fill(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, pf: &PictureFill) {
+    // An image that lives outside the package is a linked picture: `a:blip` names it through
+    // `r:link`; `r:embed` may only reference a part inside the package.
+    let linked = x.p.media(pf.media).is_some_and(|m| m.data.is_empty() && m.link.is_some());
     let rid = x.media_rel(o, pf.media, "image").unwrap_or_else(|| x.placeholder_rel(o));
-    w.open(tag, A::new().a("rotWithShape", "1"));
+    w.open(tag, A::new().a("rotWithShape", if pf.upright { "0" } else { "1" }));
     let adj = &pf.adjust;
-    let has_kids =
-        pf.alpha.is_some() || adj.brightness != 0.0 || adj.contrast != 0.0 || adj.grayscale || adj.duotone.is_some() || adj.clear_color.is_some();
-    let a = A::new().a("r:embed", &rid);
+    let has_kids = pf.alpha.is_some()
+        || adj.brightness != 0.0
+        || adj.contrast != 0.0
+        || adj.grayscale
+        || adj.duotone.is_some()
+        || adj.clear_color.is_some()
+        || adj.bilevel.is_some()
+        || adj.alpha_inv
+        || pf.artistic.is_some();
+    let a = if linked { A::new().a("r:link", &rid) } else { A::new().a("r:embed", &rid) };
     if has_kids {
         w.open("a:blip", a);
         if let Some(c) = adj.clear_color {
@@ -149,6 +126,12 @@ pub fn blip_fill(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, pf: &PictureFil
         if let Some(al) = pf.alpha {
             w.empty("a:alphaModFix", A::new().a("amt", pct(al.clamp(0.0, 1.0))));
         }
+        if adj.alpha_inv {
+            w.empty0("a:alphaInv");
+        }
+        if let Some(t) = adj.bilevel {
+            w.empty("a:biLevel", A::new().a("thresh", pct(t.clamp(0.0, 1.0))));
+        }
         if let Some((d, l)) = &adj.duotone {
             w.open0("a:duotone");
             color(w, d);
@@ -160,6 +143,25 @@ pub fn blip_fill(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, pf: &PictureFil
         }
         if adj.brightness != 0.0 || adj.contrast != 0.0 {
             w.empty("a:lum", A::new().a("bright", pct(adj.brightness.clamp(-1.0, 1.0))).a("contrast", pct(adj.contrast.clamp(-1.0, 1.0))));
+        }
+        // Artistic effect: the blip is the processed picture; the original rides in an
+        // `a14:imgLayer` with the effect's name, as PowerPoint writes it.
+        if let Some(art) = &pf.artistic
+            && art.effect.starts_with("artistic")
+            && art.effect.chars().all(|c| c.is_ascii_alphanumeric())
+            && let Some(orig) = x.media_rel(o, art.original, "image")
+        {
+            w.open0("a:extLst");
+            w.open("a:ext", A::new().a("uri", "{BEBA8EAE-BF5A-486C-A8C5-ECC9F3942E4B}"));
+            w.open("a14:imgProps", A::new().a("xmlns:a14", crate::opc::NS_A14));
+            w.open("a14:imgLayer", A::new().a("r:embed", &orig));
+            w.open0("a14:imgEffect");
+            w.empty0(&format!("a14:{}", art.effect));
+            w.close("a14:imgEffect");
+            w.close("a14:imgLayer");
+            w.close("a14:imgProps");
+            w.close("a:ext");
+            w.close("a:extLst");
         }
         w.close("a:blip");
     } else {
@@ -275,8 +277,59 @@ fn shadow(w: &mut W, tag: &str, s: &deckcraft_model::style::Shadow) {
     w.close(tag);
 }
 
+fn gradient(w: &mut W, g: &deckcraft_model::style::Gradient) {
+    w.open("a:gradFill", A::new().a("rotWithShape", if g.rotate_with_shape { "1" } else { "0" }));
+    // No stops: no `a:gsLst`, so the gradient keeps taking them from its style's fill.
+    let mut stops = g.stops.clone();
+    if stops.len() == 1 {
+        let mut s = stops[0].clone();
+        s.pos = 1.0;
+        stops.push(s);
+    }
+    if !stops.is_empty() {
+        w.open0("a:gsLst");
+        for s in &stops {
+            w.open("a:gs", A::new().a("pos", pct(s.pos.clamp(0.0, 1.0))));
+            color(w, &s.color);
+            w.close("a:gs");
+        }
+        w.close("a:gsLst");
+    }
+    match &g.shape {
+        GradientShape::Linear { angle, scaled } => w.empty("a:lin", A::new().a("ang", ang(*angle)).a("scaled", if *scaled { "1" } else { "0" })),
+        GradientShape::Path { path, focus } => {
+            let p = match path.as_str() {
+                "rect" | "shape" | "circle" => path.as_str(),
+                _ => "circle",
+            };
+            w.open("a:path", A::new().a("path", p));
+            w.empty("a:fillToRect", A::new().a("l", pct(focus[0])).a("t", pct(focus[1])).a("r", pct(focus[2])).a("b", pct(focus[3])));
+            w.close("a:path");
+        }
+    }
+    if g.tile.iter().any(|v| *v != 0.0) {
+        let [l, t, r, b] = g.tile;
+        w.empty("a:tileRect", A::new().a("l", pct(l)).a("t", pct(t)).a("r", pct(r)).a("b", pct(b)));
+    }
+    w.close("a:gradFill");
+}
+
 pub fn effects(w: &mut W, fx: &Effects) {
     w.open0("a:effectLst");
+    // Schema order: blur, fillOverlay, glow, innerShdw, outerShdw, prstShdw, reflection, softEdge.
+    if let Some(ov) = &fx.fill_overlay {
+        let blend = match ov.blend.as_str() {
+            b @ ("over" | "mult" | "screen" | "darken" | "lighten") => b,
+            _ => "over",
+        };
+        w.open("a:fillOverlay", A::new().a("blend", blend));
+        match &ov.fill {
+            Fill::Solid { color: c } => solid(w, c),
+            Fill::Gradient(g) => gradient(w, g),
+            _ => w.empty0("a:noFill"),
+        }
+        w.close("a:fillOverlay");
+    }
     if let Some(g) = &fx.glow {
         w.open("a:glow", A::new().a("rad", emu(g.radius).max(0)));
         color(w, &g.color);
@@ -307,6 +360,15 @@ pub fn effects(w: &mut W, fx: &Effects) {
         w.empty("a:softEdge", A::new().a("rad", emu(r).max(0)));
     }
     w.close("a:effectLst");
+}
+
+/// `a:sp3d` for a bevel preset when the shape or theme style has no kept 3-D XML.
+/// The preset name is limited to ASCII letters and digits so it cannot break the markup.
+pub fn bevel_sp3d(preset: &str) -> Option<String> {
+    if preset.is_empty() || preset.len() > 32 || !preset.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(format!("<a:sp3d><a:bevelT prst=\"{preset}\"/></a:sp3d>"))
 }
 
 pub fn xfrm(w: &mut W, tag: &str, x: &Xfrm, child: Option<&Xfrm>) {
@@ -347,9 +409,10 @@ pub fn hyperlink(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, h: &Hyperlink) 
         Action::LastSlide => (String::new(), Some("ppaction://hlinkshowjump?jump=lastslide".into())),
         Action::EndShow => (String::new(), Some("ppaction://hlinkshowjump?jump=endshow".into())),
         Action::LastViewed => (String::new(), Some("ppaction://hlinkshowjump?jump=lastslideviewed".into())),
-        Action::CustomShow { name } => {
+        Action::CustomShow { name, returns } => {
             let id = x.p.custom_shows.iter().position(|c| c.name == *name).unwrap_or(0);
-            (String::new(), Some(format!("ppaction://customshow?id={id}&return=true")))
+            let ret = if *returns { "true" } else { "false" };
+            (String::new(), Some(format!("ppaction://customshow?id={id}&return={ret}")))
         }
         Action::Program { path } => {
             if path.is_empty() {
@@ -359,14 +422,28 @@ pub fn hyperlink(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, h: &Hyperlink) 
         }
         Action::PlayMedia => (String::new(), Some("ppaction://media".into())),
     };
-    w.empty(
-        tag,
-        A::new()
-            .a("r:id", rid)
-            .o("action", action)
-            .o("tooltip", (!h.tooltip.is_empty()).then_some(h.tooltip.as_str()))
-            .t("highlightClick", h.highlight_click),
-    );
+    let attrs = A::new()
+        .a("r:id", rid)
+        .o("action", action)
+        .o("tooltip", (!h.tooltip.is_empty()).then_some(h.tooltip.as_str()))
+        .t("highlightClick", h.highlight_click)
+        .t("endSnd", h.stop_sound);
+    let sound = h.sound.and_then(|id| x.media_rel(o, id, "audio").map(|rid| (rid, id)));
+    let Some((sound_rid, sound_id)) = sound else {
+        w.empty(tag, attrs);
+        return;
+    };
+    w.open(tag, attrs);
+    let name = x.p.media(sound_id).map(|m| sound_label(&m.name)).unwrap_or_else(|| "sound.wav".into());
+    w.empty("a:snd", A::new().a("r:embed", sound_rid).a("name", name));
+    w.close(tag);
+}
+
+/// Display name PowerPoint stores on `a:snd`.
+fn sound_label(name: &str) -> String {
+    let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let label: String = file.chars().filter(|c| c.is_ascii() && !c.is_control() && *c != '"' && *c != '<' && *c != '>').take(80).collect();
+    if label.is_empty() { "sound.wav".into() } else { label }
 }
 
 pub fn body_pr(w: &mut W, b: &BodyProps) {
@@ -383,7 +460,8 @@ pub fn body_pr(w: &mut W, b: &BodyProps) {
         .b("rtlCol", b.rtl_col)
         .o("anchor", b.anchor.map(|a| a.xml()))
         .b("anchorCtr", b.anchor_ctr)
-        .b("upright", b.upright);
+        .b("upright", b.upright)
+        .b("spcFirstLastPara", b.space_first_last);
     let warp = b.warp.as_deref().filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric()));
     if warp.is_none() && b.autofit.is_none() {
         w.empty("a:bodyPr", a);
@@ -392,16 +470,30 @@ pub fn body_pr(w: &mut W, b: &BodyProps) {
     w.open("a:bodyPr", a);
     if let Some(p) = warp {
         w.open("a:prstTxWarp", A::new().a("prst", p));
-        w.empty0("a:avLst");
+        let adj: Vec<(usize, i64)> =
+            b.warp_adj.iter().take(8).enumerate().filter(|(_, v)| v.is_finite()).map(|(i, v)| (i, v.round().clamp(-2.0e9, 2.0e9) as i64)).collect();
+        if adj.is_empty() {
+            w.empty0("a:avLst");
+        } else {
+            let single = deckcraft_geom::warp::adjust_count(p) <= 1 && b.warp_adj.len() == 1;
+            w.open0("a:avLst");
+            for (i, v) in adj {
+                let n = if single { "adj".to_string() } else { format!("adj{}", i + 1) };
+                w.empty("a:gd", A::new().a("name", n).a("fmla", format!("val {v}")));
+            }
+            w.close("a:avLst");
+        }
         w.close("a:prstTxWarp");
     }
     match b.autofit {
         Some(AutoFit::None) => w.empty0("a:noAutofit"),
         Some(AutoFit::Shape) => w.empty0("a:spAutoFit"),
         Some(AutoFit::Shrink { font_scale, line_reduction }) => {
-            let fs = pct(font_scale.clamp(0.01, 1.0));
+            // A scale the model holds is written, 100 % included: reopening then keeps the same
+            // "draw the saved scale" state instead of becoming a bare `<a:normAutofit/>` (#724).
+            let fs = font_scale.map(|s| pct(s.clamp(0.01, 1.0)));
             let lr = pct(line_reduction.clamp(0.0, 1.0));
-            w.empty("a:normAutofit", A::new().o("fontScale", (fs != 100_000).then_some(fs)).o("lnSpcReduction", (lr != 0).then_some(lr)));
+            w.empty("a:normAutofit", A::new().o("fontScale", fs).o("lnSpcReduction", (lr != 0).then_some(lr)));
         }
         None => {}
     }
@@ -432,6 +524,8 @@ pub fn ppr(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, level: Option<u8>, p:
         .o("defTabSz", p.default_tab.map(|v| emu(v).max(0)))
         .b("rtl", p.rtl)
         .b("eaLnBrk", p.east_asian_line_break)
+        .b("latinLnBrk", p.latin_line_break)
+        .b("hangingPunct", p.hanging_punct)
         .o("fontAlgn", p.font_align.as_deref().filter(|f| matches!(*f, "auto" | "t" | "ctr" | "base" | "b")));
     let has_kids = p.line_spacing.is_some()
         || p.space_before.is_some()
@@ -477,7 +571,12 @@ pub fn ppr(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, level: Option<u8>, p:
         Some(Bullet::Picture { media }) => match x.media_rel(o, *media, "image") {
             Some(rid) => {
                 w.open0("a:buBlip");
-                w.empty("a:blip", A::new().a("r:embed", rid));
+                let a = if x.p.media(*media).is_some_and(|m| m.data.is_empty() && m.link.is_some()) {
+                    A::new().a("r:link", &rid)
+                } else {
+                    A::new().a("r:embed", &rid)
+                };
+                w.empty("a:blip", a);
                 w.close("a:buBlip");
             }
             None => w.empty("a:buChar", A::new().a("char", "•")),
@@ -535,17 +634,18 @@ pub fn rpr(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, r: &RunProps) {
         .o("spc", r.spacing.map(|s| (s.clamp(-4000.0, 4000.0) * 100.0).round() as i64))
         .o("baseline", r.baseline.map(|b| pct(b.clamp(-10.0, 10.0))))
         .b("noProof", r.no_proof);
+    let has_fx = r.shadow.is_some() || r.inner_shadow.is_some() || r.glow.is_some() || r.reflection.is_some() || r.soft_edge.is_some();
     let has_kids = r.outline.is_some()
         || r.fill.is_some()
-        || r.shadow.is_some()
-        || r.glow.is_some()
+        || has_fx
         || r.highlight.is_some()
         || r.underline_color.is_some()
         || r.font.is_some()
         || r.font_ea.is_some()
         || r.font_cs.is_some()
         || r.font_sym.is_some()
-        || r.link.is_some();
+        || r.link.is_some()
+        || r.hover.is_some();
     if !has_kids {
         w.empty(tag, a);
         return;
@@ -560,8 +660,19 @@ pub fn rpr(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, r: &RunProps) {
             f => fill(w, x, o, f),
         }
     }
-    if r.shadow.is_some() || r.glow.is_some() {
-        effects(w, &Effects { outer_shadow: r.shadow.clone(), glow: r.glow.clone(), ..Default::default() });
+    if has_fx {
+        // Same child order as a shape's effect list: glow, inner shadow, outer shadow, reflection, soft edge.
+        effects(
+            w,
+            &Effects {
+                outer_shadow: r.shadow.clone(),
+                inner_shadow: r.inner_shadow.clone(),
+                glow: r.glow.clone(),
+                reflection: r.reflection.clone(),
+                soft_edge: r.soft_edge,
+                ..Default::default()
+            },
+        );
     }
     if let Some(h) = &r.highlight {
         w.open0("a:highlight");
@@ -579,6 +690,10 @@ pub fn rpr(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, r: &RunProps) {
     typeface(w, "a:sym", &r.font_sym);
     if let Some(h) = &r.link {
         hyperlink(w, x, o, "a:hlinkClick", h);
+    }
+    // Schema order: hlinkClick, hlinkMouseOver.
+    if let Some(h) = &r.hover {
+        hyperlink(w, x, o, "a:hlinkMouseOver", h);
     }
     w.close(tag);
 }
@@ -633,8 +748,9 @@ fn run_text(w: &mut W, x: &mut Exp, o: &mut Out, text: &str, props: &RunProps) {
 
 pub fn paragraph(w: &mut W, x: &mut Exp, o: &mut Out, p: &Paragraph, math: bool, index: usize) {
     w.open0("a:p");
-    if p.level > 0 || !is_default_ppr(&p.props) {
-        ppr(w, x, o, "a:pPr", Some(p.level), &p.props, None);
+    let def = (p.def_props != RunProps::default()).then_some(&p.def_props);
+    if p.level > 0 || !is_default_ppr(&p.props) || def.is_some() {
+        ppr(w, x, o, "a:pPr", Some(p.level), &p.props, def);
     }
     for (ri, r) in p.runs.iter().enumerate() {
         match &r.kind {

@@ -9,11 +9,31 @@ use crate::{Result, Session};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
+        cmd!(
+            "guide.add",
+            "Add Guide",
+            ["View", "Show", "Guides"],
+            None,
+            "{vertical: bool, pos?: pt (default: the slide's centre)} → {index}. `defaults: true` adds the two centre guides when there are none",
+            has_doc,
+            guide_add
+        ),
+        cmd!("guide.move", "Move Guide", [], None, "{index, pos: pt}", has_doc, guide_move),
+        cmd!("guide.delete", "Delete Guide", [], None, "{index}", has_doc, guide_delete),
+        cmd!(query "guide.list", "Guides", [], None, "{} → [{vertical, pos}]", has_doc, guide_list),
         cmd!("arrange.bringToFront", "Bring to Front", ["Arrange"], Some("Cmd+Shift+]"), "{ids?}", has_selection, |s, p| order(s, p, 2)),
         cmd!("arrange.bringForward", "Bring Forward", ["Arrange"], Some("Cmd+]"), "{ids?}", has_selection, |s, p| order(s, p, 1)),
         cmd!("arrange.sendBackward", "Send Backward", ["Arrange"], Some("Cmd+["), "{ids?}", has_selection, |s, p| order(s, p, -1)),
         cmd!("arrange.sendToBack", "Send to Back", ["Arrange"], Some("Cmd+Shift+["), "{ids?}", has_selection, |s, p| order(s, p, -2)),
-        cmd!("arrange.reorder", "Reorder Objects", ["Arrange"], None, "{id, index: position in the stack (0 = back)}", has_slide, reorder),
+        cmd!(
+            "arrange.reorder",
+            "Reorder Objects",
+            ["Arrange"],
+            None,
+            "{id, index: position among its siblings (0 = back; a group's child stays in its group)} → {index}",
+            has_slide,
+            reorder
+        ),
         cmd!("arrange.group", "Group", ["Arrange"], Some("Cmd+Alt+G"), "{ids?}", has_two, group),
         cmd!("arrange.ungroup", "Ungroup", ["Arrange"], Some("Cmd+Alt+Shift+G"), "{ids?}", has_selection, ungroup),
         cmd!("arrange.regroup", "Regroup", ["Arrange"], Some("Cmd+Alt+J"), "{}", has_doc, regroup),
@@ -50,56 +70,102 @@ pub fn specs() -> Vec<CommandSpec> {
 
 fn order(s: &mut Session, p: &Value, how: i32) -> Result<Value> {
     let ids = targets(s, p)?;
+    // Already in place (front of its group, say): no change and no undo step.
+    let mut trial = s.doc()?.shapes().to_vec();
+    order_tree(&mut trial, &ids, how, 0);
+    if stacking(&trial) == stacking(s.doc()?.shapes()) {
+        return ok();
+    }
     s.edit(|doc, sel| {
         let list = crate::shapes_mut(doc, sel).ok_or_else(|| bad("arrange", "no slide"))?;
-        match how {
-            2 => {
-                let (mut moved, rest): (Vec<Shape>, Vec<Shape>) = list.drain(..).partition(|x| ids.contains(&x.id));
-                list.extend(rest);
-                list.append(&mut moved);
-            }
-            -2 => {
-                let (mut moved, rest): (Vec<Shape>, Vec<Shape>) = list.drain(..).partition(|x| ids.contains(&x.id));
-                moved.extend(rest);
-                *list = moved;
-            }
-            1 => {
-                for i in (0..list.len().saturating_sub(1)).rev() {
-                    let (a, b) = (list.get(i).map(|x| ids.contains(&x.id)), list.get(i + 1).map(|x| ids.contains(&x.id)));
-                    if a == Some(true) && b == Some(false) {
-                        list.swap(i, i + 1);
-                    }
-                }
-            }
-            _ => {
-                for i in 1..list.len() {
-                    let (a, b) = (list.get(i - 1).map(|x| ids.contains(&x.id)), list.get(i).map(|x| ids.contains(&x.id)));
-                    if a == Some(false) && b == Some(true) {
-                        list.swap(i - 1, i);
-                    }
+        order_tree(list, &ids, how, 0);
+        Ok(())
+    })?;
+    ok()
+}
+
+/// Every shape id with its depth, in tree order.
+fn stacking(v: &[Shape]) -> Vec<(ShapeId, usize)> {
+    let mut out = vec![];
+    deckcraft_model::walk(v, &mut |sh, d| out.push((sh.id, d)));
+    out
+}
+
+/// Restack `ids` among their siblings, in every list of the tree: a shape inside a group moves
+/// within its group and never leaves it (PowerPoint's Selection pane arrows work the same way).
+fn order_tree(list: &mut Vec<Shape>, ids: &[ShapeId], how: i32, depth: usize) {
+    if depth > 64 {
+        return;
+    }
+    if list.iter().any(|x| ids.contains(&x.id)) {
+        order_list(list, ids, how);
+    }
+    for sh in list.iter_mut() {
+        if let Some(children) = sh.children_mut() {
+            order_tree(children, ids, how, depth + 1);
+        }
+    }
+}
+
+fn order_list(list: &mut Vec<Shape>, ids: &[ShapeId], how: i32) {
+    match how {
+        2 => {
+            let (mut moved, rest): (Vec<Shape>, Vec<Shape>) = list.drain(..).partition(|x| ids.contains(&x.id));
+            list.extend(rest);
+            list.append(&mut moved);
+        }
+        -2 => {
+            let (mut moved, rest): (Vec<Shape>, Vec<Shape>) = list.drain(..).partition(|x| ids.contains(&x.id));
+            moved.extend(rest);
+            *list = moved;
+        }
+        1 => {
+            for i in (0..list.len().saturating_sub(1)).rev() {
+                let (a, b) = (list.get(i).map(|x| ids.contains(&x.id)), list.get(i + 1).map(|x| ids.contains(&x.id)));
+                if a == Some(true) && b == Some(false) {
+                    list.swap(i, i + 1);
                 }
             }
         }
-        Ok(())
-    })?;
-    ok()
+        _ => {
+            for i in 1..list.len() {
+                let (a, b) = (list.get(i - 1).map(|x| ids.contains(&x.id)), list.get(i).map(|x| ids.contains(&x.id)));
+                if a == Some(false) && b == Some(true) {
+                    list.swap(i - 1, i);
+                }
+            }
+        }
+    }
 }
 
+/// Move one shape to `index` among its siblings (0 = back): the Selection pane's drag and drop.
+/// A shape stays in the list that holds it, so a group's child stays in its group.
 fn reorder(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = id_param(p, "id").ok_or_else(|| bad("arrange.reorder", "missing `id`"))?;
+    let id = id_param(p, "id", "arrange.reorder")?.ok_or_else(|| bad("arrange.reorder", "missing `id`"))?;
     let to = usize_param(p, "index").ok_or_else(|| bad("arrange.reorder", "missing `index`"))?;
+    let st = s.doc()?;
+    let siblings: &[Shape] = match deckcraft_model::parent_of(st.shapes(), id) {
+        None => return Err(bad("arrange.reorder", "no such shape")),
+        Some(None) => st.shapes(),
+        Some(Some(g)) => st.shape(g).map(Shape::children).unwrap_or(&[]),
+    };
+    let from = siblings.iter().position(|x| x.id == id).ok_or_else(|| bad("arrange.reorder", "no such shape"))?;
+    if from == to.min(siblings.len().saturating_sub(1)) {
+        return Ok(json!({"index": from}));
+    }
     s.edit(|doc, sel| {
-        let list = crate::shapes_mut(doc, sel).ok_or_else(|| bad("arrange.reorder", "no slide"))?;
-        let i = list.iter().position(|x| x.id == id).ok_or_else(|| bad("arrange.reorder", "not a top-level shape"))?;
+        let tree = crate::shapes_mut(doc, sel).ok_or_else(|| bad("arrange.reorder", "no slide"))?;
+        let list = deckcraft_model::sibling_list_mut(tree, id).ok_or_else(|| bad("arrange.reorder", "no such shape"))?;
+        let i = list.iter().position(|x| x.id == id).ok_or_else(|| bad("arrange.reorder", "no such shape"))?;
         let sh = list.remove(i);
-        list.insert(to.min(list.len()), sh);
-        Ok(())
-    })?;
-    ok()
+        let at = to.min(list.len());
+        list.insert(at, sh);
+        Ok(json!({"index": at}))
+    })
 }
 
 /// Bounds of shapes (rotation included).
-fn union_bounds(xs: &[Xfrm]) -> Option<Rect> {
+pub(crate) fn union_bounds(xs: &[Xfrm]) -> Option<Rect> {
     let mut it = xs.iter().map(Xfrm::bounds);
     let first = it.next()?;
     Some(it.fold(first, |a, b| a.union(b)))
@@ -123,7 +189,7 @@ fn group(s: &mut Session, p: &Value) -> Result<Value> {
         let xs: Vec<Xfrm> = members.iter().filter_map(|m| m.xfrm).collect();
         let b = union_bounds(&xs).ok_or_else(|| bad("arrange.group", "nothing to group"))?;
         let gx = Xfrm::new(b.x0, b.y0, b.width(), b.height());
-        let id = ShapeId(doc.alloc_id());
+        let id = ShapeId(doc.alloc_id().ok_or_else(|| bad("arrange.group", NO_ID_SPACE))?);
         let n = super::current_shapes(doc, sel).map(|v| v.len()).unwrap_or(0);
         let g = Shape {
             id,
@@ -221,7 +287,7 @@ fn align(s: &mut Session, p: &Value) -> Result<Value> {
     } else {
         union_bounds(&boxes.iter().map(|b| b.1).collect::<Vec<_>>()).unwrap_or_default()
     };
-    edit_shapes(s, p, "arrange.align", |sh| {
+    edit_geometry(s, p, "arrange.align", |sh| {
         if let Some(x) = sh.xfrm.as_mut() {
             let b = x.bounds();
             let (dx, dy) = match edge.as_str() {
@@ -273,7 +339,7 @@ fn distribute(s: &mut Session, p: &Value) -> Result<Value> {
         targets_pos.push((*id, d));
         cur += (if horiz { b.width() } else { b.height() }) + gap;
     }
-    edit_shapes(s, p, "arrange.distribute", |sh| {
+    edit_geometry(s, p, "arrange.distribute", |sh| {
         if let (Some(x), Some((_, d))) = (sh.xfrm.as_mut(), targets_pos.iter().find(|(i, _)| *i == sh.id)) {
             if horiz {
                 x.x += d;
@@ -284,3 +350,76 @@ fn distribute(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(())
     })
 }
+
+/// Guides are kept on the slide; a file can hold at most this many.
+const MAX_GUIDES: usize = 200;
+
+fn guide_limit(s: &Session, vertical: bool) -> Result<f64> {
+    let size = s.doc()?.doc.slide_size;
+    Ok(if vertical { size.width } else { size.height })
+}
+
+fn guide_add(s: &mut Session, p: &Value) -> Result<Value> {
+    if bool_or(p, "defaults", false) {
+        if !s.doc()?.doc.guides.is_empty() {
+            return Ok(json!({"added": 0}));
+        }
+        let size = s.doc()?.doc.slide_size;
+        return s.edit(|doc, _| {
+            doc.guides = vec![
+                deckcraft_model::DrawGuide { vertical: true, pos: size.width / 2.0 },
+                deckcraft_model::DrawGuide { vertical: false, pos: size.height / 2.0 },
+            ];
+            Ok(json!({"added": 2}))
+        });
+    }
+    let vertical = bool_or(p, "vertical", true);
+    let limit = guide_limit(s, vertical)?;
+    let pos = p.get("pos").and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(limit / 2.0).clamp(0.0, limit);
+    if s.doc()?.doc.guides.len() >= MAX_GUIDES {
+        return Err(bad("guide.add", "too many guides"));
+    }
+    s.edit(|doc, _| {
+        doc.guides.push(deckcraft_model::DrawGuide { vertical, pos });
+        Ok(json!({"index": doc.guides.len() - 1}))
+    })
+}
+
+fn guide_index(s: &Session, p: &Value, cmd: &str) -> Result<usize> {
+    let i = usize_param(p, "index").ok_or_else(|| bad(cmd, "missing `index`"))?;
+    if i >= s.doc()?.doc.guides.len() {
+        return Err(bad(cmd, "no such guide"));
+    }
+    Ok(i)
+}
+
+fn guide_move(s: &mut Session, p: &Value) -> Result<Value> {
+    let i = guide_index(s, p, "guide.move")?;
+    let vertical = s.doc()?.doc.guides.get(i).is_some_and(|g| g.vertical);
+    let limit = guide_limit(s, vertical)?;
+    let pos = p.get("pos").and_then(Value::as_f64).filter(|v| v.is_finite()).ok_or_else(|| bad("guide.move", "missing `pos`"))?.clamp(0.0, limit);
+    s.edit(|doc, _| {
+        if let Some(g) = doc.guides.get_mut(i) {
+            g.pos = pos;
+        }
+        Ok(json!({"index": i, "pos": pos}))
+    })
+}
+
+fn guide_delete(s: &mut Session, p: &Value) -> Result<Value> {
+    let i = guide_index(s, p, "guide.delete")?;
+    s.edit(|doc, _| {
+        if i < doc.guides.len() {
+            doc.guides.remove(i);
+        }
+        ok()
+    })
+}
+
+fn guide_list(s: &mut Session, _p: &Value) -> Result<Value> {
+    Ok(serde_json::to_value(&s.doc()?.doc.guides).unwrap_or_default())
+}
+
+#[cfg(test)]
+#[path = "guides_tests.rs"]
+mod guides_tests;

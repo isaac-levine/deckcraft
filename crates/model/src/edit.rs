@@ -2,6 +2,7 @@
 //! with `\n` splits paragraphs; formatting a range splits runs at its ends.
 
 use crate::text::{Paragraph, Run, RunKind, RunProps, TextBody};
+use crate::words;
 
 /// (paragraph, char offset in the paragraph).
 pub type Pos = (usize, usize);
@@ -87,7 +88,8 @@ pub fn insert(body: &mut TextBody, pos: Pos, text: &str, props: Option<RunProps>
             let Some(p) = body.paragraphs.get_mut(pi) else { break };
             let idx = split_at(p, ch);
             let tail: Vec<Run> = p.runs.drain(idx..).collect();
-            let newp = Paragraph { level: p.level, props: p.props.clone(), runs: tail, end_props: p.end_props.clone() };
+            let newp =
+                Paragraph { level: p.level, props: p.props.clone(), runs: tail, def_props: p.def_props.clone(), end_props: p.end_props.clone() };
             p.end_props = props.clone();
             body.paragraphs.insert(pi + 1, newp);
             pi += 1;
@@ -275,63 +277,107 @@ pub fn insert_body(body: &mut TextBody, pos: Pos, src: &TextBody) -> Pos {
     caret
 }
 
-fn is_word(c: char) -> bool {
-    c.is_alphanumeric() || c == '_' || c == '\''
+fn para_text(body: &TextBody, pi: usize) -> String {
+    body.paragraphs.get(pi).map(Paragraph::text).unwrap_or_default()
 }
 
-/// Word boundaries around `pos` (double-click selection).
+/// The word a double-click selects around `pos` (see [`words::word_at`]): the word without its
+/// trailing spaces, as PowerPoint selects it.
 pub fn word_at(body: &TextBody, pos: Pos) -> (Pos, Pos) {
     let (pi, ch) = clamp(body, pos);
-    let t: Vec<char> = body.paragraphs.get(pi).map(|p| p.text().chars().collect()).unwrap_or_default();
-    if t.is_empty() {
-        return ((pi, 0), (pi, 0));
-    }
-    let at = ch.min(t.len().saturating_sub(1));
-    let w = t.get(at).copied().is_some_and(is_word);
-    let mut s = at;
-    while s > 0 && t.get(s - 1).copied().is_some_and(|c| is_word(c) == w && !c.is_whitespace() || (w && is_word(c))) {
-        s -= 1;
-    }
-    let mut e = at;
-    while e < t.len() && t.get(e).copied().is_some_and(|c| is_word(c) == w && (w || !c.is_whitespace())) {
-        e += 1;
-    }
-    // Include trailing spaces after a word.
-    while w && e < t.len() && t.get(e) == Some(&' ') {
-        e += 1;
-    }
-    ((pi, s), (pi, e.max(s)))
+    let (s, e) = words::word_at(&para_text(body, pi), ch);
+    ((pi, s), (pi, e))
 }
 
-/// Next/previous word start (Option/Ctrl + arrows).
+/// Next/previous word stop (Ctrl+Right/Left on Windows, Option+arrows on the Mac). At the end of
+/// a paragraph Ctrl+Right goes to the start of the next one; at its start Ctrl+Left goes to the
+/// end of the previous one.
 pub fn word_move(body: &TextBody, pos: Pos, forward: bool) -> Pos {
     let (pi, ch) = clamp(body, pos);
-    let t: Vec<char> = body.paragraphs.get(pi).map(|p| p.text().chars().collect()).unwrap_or_default();
+    let t = para_text(body, pi);
     if forward {
-        if ch >= t.len() {
-            return if pi + 1 < body.paragraphs.len() { (pi + 1, 0) } else { (pi, ch) };
+        match words::next_stop(&t, ch) {
+            Some(s) => (pi, s),
+            None if pi + 1 < body.paragraphs.len() => (pi + 1, 0),
+            None => (pi, ch),
         }
-        let mut i = ch;
-        while i < t.len() && t.get(i).copied().is_some_and(is_word) {
-            i += 1;
-        }
-        while i < t.len() && !t.get(i).copied().is_some_and(is_word) {
-            i += 1;
-        }
-        (pi, i)
     } else {
-        if ch == 0 {
-            return if pi > 0 { (pi - 1, body.paragraphs.get(pi - 1).map(Paragraph::char_len).unwrap_or(0)) } else { (0, 0) };
+        match words::prev_stop(&t, ch) {
+            Some(s) => (pi, s),
+            None if pi > 0 => (pi - 1, body.paragraphs.get(pi - 1).map(Paragraph::char_len).unwrap_or(0)),
+            None => (pi, 0),
         }
-        let mut i = ch;
-        while i > 0 && !t.get(i - 1).copied().is_some_and(is_word) {
-            i -= 1;
-        }
-        while i > 0 && t.get(i - 1).copied().is_some_and(is_word) {
-            i -= 1;
-        }
-        (pi, i)
     }
+}
+
+/// Ctrl+Up: the start of the paragraph, or of the previous one when already there.
+pub fn para_up(body: &TextBody, pos: Pos) -> Pos {
+    let (pi, ch) = clamp(body, pos);
+    if ch > 0 { (pi, 0) } else { (pi.saturating_sub(1), 0) }
+}
+
+/// Ctrl+Down: the start of the next paragraph, or the end of the last one.
+pub fn para_down(body: &TextBody, pos: Pos) -> Pos {
+    let (pi, _) = clamp(body, pos);
+    if pi + 1 < body.paragraphs.len() { (pi + 1, 0) } else { (pi, body.paragraphs.get(pi).map(Paragraph::char_len).unwrap_or(0)) }
+}
+
+/// Delete a word from `pos` as Ctrl+Backspace (`forward == false`) or Ctrl+Delete does in
+/// PowerPoint; returns the caret.
+///
+/// Ctrl+Backspace deletes back to the previous word stop (at a paragraph's start it joins the
+/// paragraph to the one before). Ctrl+Delete deletes the rest of the word, or the spaces after a
+/// word and the next word, or up to the next stop (see [`words::delete_forward_end`]), then
+/// tidies the spacing as PowerPoint's smart cut does: spaces left before closing punctuation or
+/// at the end of the paragraph after a word go, and sentence punctuation left against a word
+/// gets a space. At a paragraph's end it joins the next paragraph.
+pub fn delete_word(body: &mut TextBody, pos: Pos, forward: bool) -> Pos {
+    if body.paragraphs.is_empty() {
+        return (0, 0);
+    }
+    let (pi, ch) = clamp(body, pos);
+    let t = para_text(body, pi);
+    if !forward {
+        let to = match words::prev_stop(&t, ch) {
+            Some(s) => (pi, s),
+            None => char_move(body, (pi, ch), false),
+        };
+        return delete(body, to, (pi, ch));
+    }
+    let Some(e) = words::delete_forward_end(&t, ch) else {
+        let to = char_move(body, (pi, ch), true);
+        return delete(body, (pi, ch), to);
+    };
+    let at = delete(body, (pi, ch), (pi, e));
+    smart_space(body, at)
+}
+
+/// PowerPoint's smart-cut spacing after a word was deleted at `at`; returns the caret.
+fn smart_space(body: &mut TextBody, at: Pos) -> Pos {
+    let (pi, s) = at;
+    let chars: Vec<char> = para_text(body, pi).chars().collect();
+    let after = chars.get(s).copied();
+    let before = s.checked_sub(1).and_then(|i| chars.get(i)).copied();
+    if after.is_none_or(words::is_closing_punct) && before.is_some_and(|c| c == ' ') {
+        let mut w = s;
+        while w > 0 && chars.get(w - 1) == Some(&' ') {
+            w -= 1;
+        }
+        if w > 0 && chars.get(w - 1).is_some_and(|c| c.is_alphanumeric()) {
+            return delete(body, (pi, w), (pi, s));
+        }
+        return at;
+    }
+    if let (Some(b), Some(a)) = (before, after)
+        && words::is_sentence_punct(b)
+        && a.is_alphanumeric()
+    {
+        let digits = s >= 2 && chars.get(s - 2).is_some_and(|c| c.is_numeric()) && a.is_numeric();
+        if !digits {
+            return insert(body, at, " ", None);
+        }
+    }
+    at
 }
 
 /// One character left/right across paragraph boundaries.
@@ -355,10 +401,60 @@ pub fn char_move(body: &TextBody, pos: Pos, forward: bool) -> Pos {
     }
 }
 
+/// The position of the `n`th character of the body's plain text (`\n` between paragraphs).
+fn pos_of_char(body: &TextBody, mut n: usize) -> Pos {
+    for (pi, p) in body.paragraphs.iter().enumerate() {
+        let len = p.char_len();
+        if n <= len {
+            return (pi, n);
+        }
+        n -= len + 1;
+    }
+    end(body)
+}
+
+/// Make the body's plain text (paragraphs joined by `\n`) read `text`, as if it had been typed in
+/// place: only the span between the longest common prefix and suffix changes, so untouched text
+/// keeps its run and paragraph formatting and new text takes the formatting where it lands. Text
+/// that shares nothing with the old text replaces it as plain text.
+pub fn replace_text(body: &mut TextBody, text: &str) {
+    let old: Vec<char> = body.text().chars().collect();
+    let new: Vec<char> = text.chars().collect();
+    if old == new {
+        return;
+    }
+    let pre = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let room = old.len().min(new.len()) - pre;
+    let suf = old.iter().rev().zip(new.iter().rev()).take(room).take_while(|(a, b)| a == b).count();
+    if pre == 0 && suf == 0 {
+        *body = TextBody { body: body.body.clone(), list_style: body.list_style.clone(), ..TextBody::from_text(text) };
+        return;
+    }
+    let a = pos_of_char(body, pre);
+    let b = pos_of_char(body, old.len() - suf);
+    let at = delete(body, a, b);
+    let mid: String = new.get(pre..new.len() - suf).unwrap_or(&[]).iter().collect();
+    if !mid.is_empty() {
+        insert(body, at, &mid, None);
+    }
+}
+
 /// End of the body.
 pub fn end(body: &TextBody) -> Pos {
     let pi = body.paragraphs.len().saturating_sub(1);
     (pi, body.paragraphs.get(pi).map(Paragraph::char_len).unwrap_or(0))
+}
+
+/// The case Shift+F3 changes `s` to next, as PowerPoint cycles it: lowercase → Capitalize Each
+/// Word → UPPERCASE → lowercase; any other mix goes to UPPERCASE first.
+pub fn next_case(s: &str) -> &'static str {
+    if s == s.to_lowercase() && s.chars().any(char::is_alphabetic) {
+        "title"
+    } else if s == s.to_uppercase() && s.chars().any(char::is_alphabetic) {
+        "lower"
+    } else {
+        "upper"
+    }
 }
 
 /// Change case: `upper`, `lower`, `sentence`, `title`, `toggle`.
@@ -456,7 +552,7 @@ mod tests {
     #[test]
     fn words_and_moves() {
         let b = body("Hello brave world");
-        assert_eq!(word_at(&b, (0, 7)), ((0, 6), (0, 12)));
+        assert_eq!(word_at(&b, (0, 7)), ((0, 6), (0, 11)));
         assert_eq!(word_move(&b, (0, 0), true), (0, 6));
         assert_eq!(word_move(&b, (0, 8), false), (0, 6));
         assert_eq!(char_move(&b, (0, 17), true), (0, 17));
@@ -471,5 +567,200 @@ mod tests {
         assert_eq!(c, (0, 2));
         assert_eq!(b.paragraphs[0].char_len(), 3);
         assert_eq!(b.paragraphs.len(), 1);
+    }
+
+    /// Ctrl+Backspace / Ctrl+Delete from `at`: the text and caret after (PowerPoint's results).
+    fn del_word(text: &str, at: Pos, forward: bool) -> (String, Pos) {
+        let mut b = body(text);
+        let c = delete_word(&mut b, at, forward);
+        (b.text(), c)
+    }
+
+    #[test]
+    fn ctrl_backspace_like_powerpoint() {
+        let t = "ab   cd...ef gh";
+        let want = [
+            ("ab   cd...ef gh", 0),
+            ("b   cd...ef gh", 0),
+            ("   cd...ef gh", 0),
+            ("  cd...ef gh", 0),
+            (" cd...ef gh", 0),
+            ("cd...ef gh", 0),
+            ("ab   d...ef gh", 5),
+            ("ab   ...ef gh", 5),
+            ("ab   cd..ef gh", 7),
+            ("ab   cd.ef gh", 7),
+            ("ab   cdef gh", 7),
+            ("ab   cd...f gh", 10),
+            ("ab   cd... gh", 10),
+            ("ab   cd...gh", 10),
+            ("ab   cd...ef h", 13),
+            ("ab   cd...ef ", 13),
+        ];
+        for (c, (txt, caret)) in want.iter().enumerate() {
+            assert_eq!(del_word(t, (0, c), false), (txt.to_string(), (0, *caret)), "caret {c}");
+        }
+        let w = "Hello world  foo, bar\nnext para";
+        assert_eq!(del_word(w, (0, 12), false), ("Hello  foo, bar\nnext para".into(), (0, 6)));
+        assert_eq!(del_word(w, (0, 17), false), ("Hello world  foo bar\nnext para".into(), (0, 16)));
+        // At a paragraph's start it joins the paragraph before.
+        assert_eq!(del_word(w, (1, 0), false), ("Hello world  foo, barnext para".into(), (0, 21)));
+        assert_eq!(del_word("ab\n  cd", (1, 2), false), ("ab\ncd".into(), (1, 0)));
+        // A line break is a word of its own.
+        let mut b = body("ab");
+        insert(&mut b, (0, 2), "\u{b}cd", None);
+        assert_eq!(delete_word(&mut b, (0, 3), false), (0, 2));
+        assert_eq!(b.text(), "abcd");
+        let mut b = body("ab");
+        insert(&mut b, (0, 2), "\u{b}cd", None);
+        assert_eq!(delete_word(&mut b, (0, 2), true), (0, 2));
+        assert_eq!(b.text(), "abcd");
+        assert_eq!(del_word("x", (0, 0), false), ("x".into(), (0, 0)));
+        // Emoji sequences and combining marks are never split.
+        assert_eq!(del_word("a 👨\u{200d}👩\u{200d}👧", (0, 7), false), ("a ".into(), (0, 2)));
+        assert_eq!(del_word("ce\u{301}te x", (0, 5), false), (" x".into(), (0, 0)));
+        assert_eq!(del_word("ce\u{301}te x", (0, 6), false), ("x".into(), (0, 0)));
+        // Each CJK character is a word.
+        assert_eq!(del_word("日本語", (0, 3), false), ("日本".into(), (0, 2)));
+    }
+
+    #[test]
+    fn ctrl_delete_like_powerpoint() {
+        let t = "ab   cd...ef gh";
+        let want = [
+            ("cd...ef gh", 0),
+            ("a   cd...ef gh", 1),
+            ("ab...ef gh", 2),
+            ("ab cd...ef gh", 3),
+            ("ab  cd...ef gh", 4),
+            ("ab...ef gh", 2),
+            ("ab   c...ef gh", 6),
+            ("ab   cdef gh", 7),
+            ("ab   cd. ef gh", 9),
+            ("ab   cd.. ef gh", 10),
+            ("ab   cd... gh", 11),
+            ("ab   cd...e gh", 11),
+            ("ab   cd...ef", 12),
+            ("ab   cd...ef", 12),
+            ("ab   cd...ef g", 14),
+            ("ab   cd...ef gh", 15),
+        ];
+        for (c, (txt, caret)) in want.iter().enumerate() {
+            assert_eq!(del_word(t, (0, c), true), (txt.to_string(), (0, *caret)), "caret {c}");
+        }
+        let w = "Hello world  foo, bar\nnext para";
+        let want = [
+            (0, "world  foo, bar\nnext para", 0),
+            (2, "He world  foo, bar\nnext para", 2),
+            (5, "Hello  foo, bar\nnext para", 5),
+            (6, "Hello foo, bar\nnext para", 6),
+            (8, "Hello wo  foo, bar\nnext para", 8),
+            (11, "Hello world, bar\nnext para", 11),
+            (12, "Hello world foo, bar\nnext para", 12),
+            (16, "Hello world  foobar\nnext para", 16),
+            (17, "Hello world  foo,\nnext para", 17),
+            (18, "Hello world  foo, \nnext para", 18),
+            (21, "Hello world  foo, barnext para", 21),
+        ];
+        for (c, txt, caret) in want {
+            assert_eq!(del_word(w, (0, c), true), (txt.to_string(), (0, caret)), "caret {c}");
+        }
+        assert_eq!(del_word(w, (1, 0), true), ("Hello world  foo, bar\npara".into(), (1, 0)));
+        assert_eq!(del_word(w, (1, 2), true), ("Hello world  foo, bar\nne para".into(), (1, 2)));
+        assert_eq!(del_word("ab  \ncd", (0, 2), true), ("ab\ncd".into(), (0, 2)));
+        assert_eq!(del_word("ab  \ncd", (0, 3), true), ("ab\ncd".into(), (0, 2)));
+        assert_eq!(del_word("ab\t cd", (0, 2), true), ("ab cd".into(), (0, 2)));
+        assert_eq!(del_word("ab cd(x) ef", (0, 3), true), ("ab (x) ef".into(), (0, 3)));
+        assert_eq!(del_word("ab cd, ef", (0, 3), true), ("ab, ef".into(), (0, 2)));
+        assert_eq!(del_word("ab. (cd) ef", (0, 5), true), ("ab. () ef".into(), (0, 5)));
+        assert_eq!(del_word("ab \"cd\" ef", (0, 4), true), ("ab \"\" ef".into(), (0, 4)));
+        assert_eq!(del_word("ab, cd", (0, 4), true), ("ab, ".into(), (0, 4)));
+        // Right-to-left text deletes in logical order like any other.
+        assert_eq!(del_word("مرحبا بالعالم hello", (0, 6), true), ("مرحبا hello".into(), (0, 6)));
+        assert_eq!(del_word("مرحبا بالعالم hello", (0, 8), false), ("مرحبا لعالم hello".into(), (0, 6)));
+        // Numbers keep their separators: no space is pushed into "3.14".
+        assert_eq!(del_word("3.x 14", (0, 2), true), ("3.14".into(), (0, 2)));
+        // Hostile positions clamp.
+        assert_eq!(del_word("ab", (9, 9), true).0, "ab");
+        assert_eq!(del_word("", (0, 0), false).0, "");
+        let mut empty = TextBody::default();
+        assert_eq!(delete_word(&mut empty, (3, 3), true), (0, 0));
+    }
+
+    #[test]
+    fn paragraph_moves() {
+        let b = body("one two\nthree\n\nfour");
+        assert_eq!(para_down(&b, (0, 2)), (1, 0));
+        assert_eq!(para_down(&b, (1, 0)), (2, 0));
+        assert_eq!(para_down(&b, (3, 1)), (3, 4));
+        assert_eq!(para_up(&b, (3, 2)), (3, 0));
+        assert_eq!(para_up(&b, (3, 0)), (2, 0));
+        assert_eq!(para_up(&b, (0, 0)), (0, 0));
+        assert_eq!(word_move(&b, (0, 4), true), (0, 7));
+        assert_eq!(word_move(&b, (0, 7), true), (1, 0));
+        assert_eq!(word_move(&b, (1, 0), false), (0, 7));
+        assert_eq!(word_move(&b, (2, 0), true), (3, 0));
+        assert_eq!(word_move(&b, (3, 4), true), (3, 4));
+        assert_eq!(word_move(&b, (0, 0), false), (0, 0));
+    }
+
+    #[test]
+    fn case_cycle() {
+        assert_eq!(next_case("hello world"), "title");
+        assert_eq!(next_case("Hello World"), "upper");
+        assert_eq!(next_case("HELLO WORLD"), "lower");
+        assert_eq!(next_case("Hello world"), "upper");
+        assert_eq!(next_case("hELLO wORLD"), "upper");
+        assert_eq!(next_case("hello. world is HERE"), "upper");
+        assert_eq!(next_case("123"), "upper");
+    }
+
+    /// Speaker notes: a bold heading over indented bullet points.
+    fn notes() -> TextBody {
+        use crate::text::{Bullet, ParaProps};
+        let mut b = body("Overview\nFirst point\nSecond point");
+        format(&mut b, (0, 0), (0, 8), &|p| p.bold = Some(true));
+        for p in b.paragraphs.iter_mut().skip(1) {
+            p.level = 1;
+            p.props =
+                ParaProps { margin_left: Some(36.0), indent: Some(-18.0), bullet: Some(Bullet::Char { char: "•".into() }), ..Default::default() };
+        }
+        b
+    }
+
+    #[test]
+    fn replace_text_keeps_formatting() {
+        let before = notes();
+        // Same text: nothing changes.
+        let mut b = before.clone();
+        replace_text(&mut b, "Overview\nFirst point\nSecond point");
+        assert_eq!(b, before);
+        // A word typed into a bullet: heading stays bold, bullets keep level, indent and bullet.
+        replace_text(&mut b, "Overview\nFirst main point\nSecond point");
+        assert_eq!(b.text(), "Overview\nFirst main point\nSecond point");
+        assert_eq!(b.paragraphs[0].runs[0].props.bold, Some(true));
+        assert_eq!(b.paragraphs[1].props, before.paragraphs[1].props);
+        assert_eq!((b.paragraphs[1].level, b.paragraphs[2].level), (1, 1));
+        // Typing at the end of the heading continues it in bold.
+        replace_text(&mut b, "Overview (5 min)\nFirst main point\nSecond point");
+        assert_eq!(b.paragraphs[0].runs.len(), 1);
+        assert_eq!(b.paragraphs[0].runs[0].props.bold, Some(true));
+        // Enter after a bullet starts another bullet; deleting one joins nothing else.
+        replace_text(&mut b, "Overview (5 min)\nFirst main point\nThird\nSecond point");
+        assert_eq!(b.paragraphs.len(), 4);
+        assert_eq!((b.paragraphs[2].level, &b.paragraphs[2].props), (1, &before.paragraphs[1].props));
+        replace_text(&mut b, "Overview (5 min)\nSecond point");
+        assert_eq!(b.text(), "Overview (5 min)\nSecond point");
+        assert_eq!(b.paragraphs[0].runs[0].props.bold, Some(true));
+        assert_eq!(b.paragraphs[1].level, 1);
+        // Text with nothing in common is new plain text.
+        replace_text(&mut b, "Plain");
+        assert_eq!(b, body("Plain"));
+        replace_text(&mut b, "");
+        assert!(b.is_empty());
+        // Into an empty body.
+        let mut e = TextBody::default();
+        replace_text(&mut e, "a\nb");
+        assert_eq!(e.text(), "a\nb");
     }
 }
