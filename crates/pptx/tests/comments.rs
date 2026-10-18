@@ -97,6 +97,9 @@ fn package_carries_both_parts_and_the_slide_anchor() {
     let bytes = deckcraft_pptx::export(&deck()).expect("export");
     let modern = part(&bytes, "ppt/comments/modernComment1.xml");
     assert!(modern.contains("p188:cmLst"), "{modern}");
+    // The a: prefix used by the comment bodies must be declared on the root (issue #974).
+    let root = modern.split("<p188:cm ").next().unwrap_or("");
+    assert!(root.contains("xmlns:a="), "{root}");
     // The thread and the second reply are resolved; the first reply is not.
     assert_eq!(modern.matches(r#"status="resolved""#).count(), 2, "{modern}");
     assert!(modern.contains("p188:replyLst") && modern.contains("A &lt;reply&gt; &amp; more"), "{modern}");
